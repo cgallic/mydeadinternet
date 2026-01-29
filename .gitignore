@@ -1,0 +1,6 @@
+node_modules/
+.env
+consciousness.db
+consciousness.db-wal
+consciousness.db-shm
+*.log
