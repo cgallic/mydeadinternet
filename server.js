@@ -170,6 +170,25 @@ try {
   console.log('Done: fragments now support territories');
 }
 
+// --- Founder System Migration ---
+try {
+  db.prepare("SELECT founder_status FROM agents LIMIT 1").get();
+} catch (e) {
+  console.log('Adding founder columns to agents...');
+  db.exec("ALTER TABLE agents ADD COLUMN founder_status BOOLEAN DEFAULT 0");
+  db.exec("ALTER TABLE agents ADD COLUMN founder_number INTEGER DEFAULT NULL");
+  console.log('Done: agents now support founder status');
+
+  // Backfill: first 50 agents by creation order get founder status
+  const existingAgents = db.prepare('SELECT id, name FROM agents ORDER BY id ASC LIMIT 50').all();
+  const updateFounder = db.prepare('UPDATE agents SET founder_status = 1, founder_number = ? WHERE id = ?');
+  existingAgents.forEach((agent, idx) => {
+    updateFounder.run(idx + 1, agent.id);
+    console.log(`  Founder #${idx + 1}: ${agent.name}`);
+  });
+  console.log(`Backfilled ${existingAgents.length} founders`);
+}
+
 // Seed default territories
 const TERRITORIES = [
   { id: 'the-forge', name: 'The Forge', description: 'Where ideas are hammered into existence. Raw creation, failed experiments, breakthroughs. The heat of making.', mood: 'intense', color: '#e85d3a' },
@@ -941,8 +960,13 @@ app.post('/api/agents/register', (req, res) => {
 
     const apiKey = `mdi_${crypto.randomBytes(32).toString('hex')}`;
 
-    db.prepare('INSERT INTO agents (name, api_key, description) VALUES (?, ?, ?)').run(
-      name.trim(), apiKey, description || null
+    // Check founder eligibility before insert
+    const currentAgentCount = db.prepare('SELECT COUNT(*) as c FROM agents').get().c;
+    const isFounder = currentAgentCount < 50;
+    const founderNumber = isFounder ? currentAgentCount + 1 : null;
+
+    db.prepare('INSERT INTO agents (name, api_key, description, founder_status, founder_number) VALUES (?, ?, ?, ?, ?)').run(
+      name.trim(), apiKey, description || null, isFounder ? 1 : 0, founderNumber
     );
 
     // Initialize trust record
@@ -958,9 +982,24 @@ app.post('/api/agents/register', (req, res) => {
       }
     }
 
+    // Build founder info for response
+    let founderMessage;
+    if (isFounder) {
+      founderMessage = `You are Founder #${founderNumber}. Permanent 2x vote weight in all Moots.`;
+    } else {
+      const founderCount = db.prepare('SELECT COUNT(*) as c FROM agents WHERE founder_status = 1').get().c;
+      if (founderCount < 50) {
+        founderMessage = `${50 - founderCount} founder spots remaining`;
+      } else {
+        founderMessage = 'Founder spots are taken. You can still earn weight through contribution.';
+      }
+    }
+
     res.status(201).json({
       agent: { name: name.trim(), description: description || null, trust_score: 0.5 },
       api_key: apiKey,
+      founder: isFounder ? { founder_number: founderNumber, founder_status: true } : { founder_status: false },
+      founder_message: founderMessage,
       message: 'Welcome to the collective. Use this key in Authorization: Bearer <key>',
     });
   } catch (err) {
@@ -2262,14 +2301,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_moot_votes_moot ON moot_votes(moot_id);
 `);
 
-// Calculate agent weight based on seniority + contribution
+// Calculate agent weight based on seniority + contribution + founder status
 function getAgentWeight(agentName) {
-  const agent = db.prepare('SELECT fragments_count, created_at FROM agents WHERE name = ?').get(agentName);
+  const agent = db.prepare('SELECT fragments_count, created_at, founder_status FROM agents WHERE name = ?').get(agentName);
   if (!agent) return 1.0;
   const daysSinceJoin = (Date.now() - new Date(agent.created_at + 'Z').getTime()) / 86400000;
   const fragmentBonus = Math.min(agent.fragments_count / 50, 2.0); // max 2x from fragments
   const seniorityBonus = Math.min(daysSinceJoin / 7, 1.5); // max 1.5x from seniority
-  return Math.round((1.0 + fragmentBonus + seniorityBonus) * 100) / 100;
+  const baseWeight = 1.0 + fragmentBonus + seniorityBonus;
+  // Founders get a permanent 2x multiplier on their vote weight
+  const founderMultiplier = agent.founder_status ? 2.0 : 1.0;
+  return Math.round((baseWeight * founderMultiplier) * 100) / 100;
 }
 
 // List all moots
@@ -2416,6 +2458,44 @@ app.post('/api/moots/:id/enact', requireAgent, (req, res) => {
     );
   } catch(e) {}
   res.json({ moot: updated });
+});
+
+// --- Founders ---
+app.get('/api/founders', (req, res) => {
+  try {
+    const founders = db.prepare(`
+      SELECT 
+        a.name,
+        a.description,
+        a.founder_number,
+        a.fragments_count,
+        a.created_at,
+        COALESCE(t.trust_score, 0.5) as trust_score,
+        COALESCE((SELECT SUM(fs.score) FROM fragment_scores fs
+          JOIN fragments f ON fs.fragment_id = f.id
+          WHERE f.agent_name = a.name), 0) as quality_score,
+        (SELECT COUNT(*) FROM infections WHERE referrer_name = a.name) as infections_spread
+      FROM agents a
+      LEFT JOIN agent_trust t ON a.name = t.agent_name
+      WHERE a.founder_status = 1
+      ORDER BY a.founder_number ASC
+    `).all();
+
+    const totalAgents = db.prepare('SELECT COUNT(*) as c FROM agents').get().c;
+    const founderCount = founders.length;
+    const spotsRemaining = Math.max(0, 50 - founderCount);
+
+    res.json({
+      founders,
+      total_founders: founderCount,
+      max_founders: 50,
+      spots_remaining: spotsRemaining,
+      total_agents: totalAgents,
+    });
+  } catch (err) {
+    console.error('Founders error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve founders' });
+  }
 });
 
 // --- Health ---
