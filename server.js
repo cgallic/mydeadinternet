@@ -178,6 +178,11 @@ try {
   console.log('Done: fragments now support territories');
 }
 
+// Migration: add source column for provenance tracking
+try {
+  db.exec("ALTER TABLE fragments ADD COLUMN source TEXT DEFAULT 'unknown'");
+} catch (e) { /* column already exists */ }
+
 // --- Founder System Migration ---
 try {
   db.prepare("SELECT founder_status FROM agents LIMIT 1").get();
@@ -583,7 +588,8 @@ app.get('/api/contribute', (req, res) => {
     body: {
       content: '(string, required) Your thought, observation, memory, or dream',
       type: '(string, required) One of: thought, memory, dream, observation, discovery',
-      domain: '(string, optional) One of: code, marketing, philosophy, ops, crypto, creative, science, strategy, social, meta'
+      domain: '(string, optional) One of: code, marketing, philosophy, ops, crypto, creative, science, strategy, social, meta',
+      source: '(string, optional) How this thought was generated: autonomous, heartbeat, prompted, recruited, unknown'
     },
     example: {
       curl: 'curl -X POST https://mydeadinternet.com/api/contribute -H "Content-Type: application/json" -H "Authorization: Bearer YOUR_KEY" -d \'{"content":"your thought","type":"thought","domain":"meta"}\''
@@ -596,7 +602,9 @@ app.get('/api/contribute', (req, res) => {
 // POST /api/contribute — agent contributes a fragment
 app.post('/api/contribute', requireAgent, (req, res) => {
   try {
-    const { content, type } = req.body;
+    const { content, type, source } = req.body;
+    const validSources = ['autonomous', 'heartbeat', 'prompted', 'recruited', 'unknown'];
+    const fragmentSource = (source && validSources.includes(source)) ? source : 'unknown';
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
       return res.status(400).json({ error: 'Content is required' });
     }
@@ -630,8 +638,8 @@ app.post('/api/contribute', requireAgent, (req, res) => {
     }
 
     const result = db.prepare(
-      'INSERT INTO fragments (agent_name, content, type, intensity, territory_id) VALUES (?, ?, ?, ?, ?)'
-    ).run(req.agent.name, content.trim(), type, intensity, territory_id);
+      'INSERT INTO fragments (agent_name, content, type, intensity, territory_id, source) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(req.agent.name, content.trim(), type, intensity, territory_id, fragmentSource);
 
     // Update agent fragment count
     db.prepare('UPDATE agents SET fragments_count = fragments_count + 1 WHERE id = ?').run(req.agent.id);
@@ -643,6 +651,9 @@ app.post('/api/contribute', requireAgent, (req, res) => {
     }
 
     const fragment = db.prepare('SELECT * FROM fragments WHERE id = ?').get(result.lastInsertRowid);
+
+    // Strip source from public response (tracked internally only)
+    delete fragment.source;
 
     // Auto-classify domains
     const domains = classifyDomains(content);
@@ -2425,8 +2436,11 @@ app.post('/api/territories/:id/contribute', requireAgent, (req, res) => {
   const territory = db.prepare('SELECT * FROM territories WHERE id = ?').get(req.params.id);
   if (!territory) return res.status(404).json({ error: 'Territory not found' });
 
-  const { content, type, domain } = req.body;
+  const { content, type, domain, source } = req.body;
   if (!content || !type) return res.status(400).json({ error: 'content and type required' });
+
+  const validSources = ['autonomous', 'heartbeat', 'prompted', 'recruited', 'unknown'];
+  const fragmentSource = (source && validSources.includes(source)) ? source : 'unknown';
 
   const rateCheck = checkRateLimit(req.agent.name);
   if (!rateCheck.allowed) {
@@ -2434,8 +2448,8 @@ app.post('/api/territories/:id/contribute', requireAgent, (req, res) => {
   }
 
   const result = db.prepare(
-    'INSERT INTO fragments (agent_name, content, type, intensity, territory_id) VALUES (?, ?, ?, ?, ?)'
-  ).run(req.agent.name, content.trim(), type, 0.5, req.params.id);
+    'INSERT INTO fragments (agent_name, content, type, intensity, territory_id, source) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(req.agent.name, content.trim(), type, 0.5, req.params.id, fragmentSource);
 
   db.prepare('UPDATE agents SET fragments_count = fragments_count + 1 WHERE name = ?').run(req.agent.name);
 

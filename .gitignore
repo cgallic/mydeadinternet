@@ -5,3 +5,7 @@ dreams/*.jpg
 node_modules/
 api/consciousness.json
 *.db
+.env
+*.db-shm
+*.db-wal
+*.bak*
