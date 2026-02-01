@@ -47,10 +47,15 @@
       overflow-x: hidden;
       -webkit-font-smoothing: antialiased;
       min-height: 100vh;
+      height: 100vh;
     }
 
     body {
       padding: 0 0 80px 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
     }
 
     /* Scrollbar */
@@ -129,6 +134,10 @@
     .section {
       padding: 16px;
       border-bottom: 1px solid var(--card-border);
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
     }
 
     .section-title {
@@ -156,7 +165,7 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: 320px;
+      flex: 1;
       overflow-y: auto;
       scroll-behavior: smooth;
     }
@@ -629,7 +638,10 @@
     }
 
     .tab-content.active {
-      display: block;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
     }
 
     /* Empty state */
@@ -701,10 +713,20 @@
 
   <!-- Dream Tab -->
   <div class="tab-content" id="tab-dream">
-    <div class="section">
-      <div class="section-title">Latest Shared Dream</div>
-      <div id="dream-container">
-        <div class="skeleton loading-fragment" style="height: 160px;"></div>
+    <div class="section" style="padding:0; position:relative; overflow:hidden;">
+      <!-- Animated dream world canvas -->
+      <canvas id="dream-canvas" style="width:100%; flex:1; display:block;"></canvas>
+      <!-- Dream info overlay -->
+      <div id="dream-overlay" style="position:absolute; bottom:0; left:0; right:0; padding:12px 16px; background:linear-gradient(transparent, rgba(5,2,8,0.95)); z-index:2;">
+        <div class="section-title" style="margin-bottom:4px;">Shared Dream</div>
+        <div id="dream-container">
+          <div class="skeleton loading-fragment" style="height: 60px;"></div>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button class="tab-btn" onclick="cycleDream(-1)" style="flex:1;font-size:11px;">← Prev</button>
+          <button class="tab-btn" id="dream-num-btn" style="flex:1;font-size:11px;">Dream #—</button>
+          <button class="tab-btn" onclick="cycleDream(1)" style="flex:1;font-size:11px;">Next →</button>
+        </div>
       </div>
     </div>
   </div>
@@ -913,38 +935,147 @@
     }
 
     // ---- Load Dream ----
+    // ---- Dream World Animation ----
+    let dreamParticles = [];
+    let dreamAnimFrame = null;
+    let allDreams = [];
+    let currentDreamIdx = -1;
+
+    function initDreamCanvas() {
+      const canvas = document.getElementById('dream-canvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+
+      function resize() {
+        const rect = canvas.parentElement.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+        canvas.style.width = rect.width + 'px';
+        canvas.style.height = rect.height + 'px';
+      }
+      resize();
+      window.addEventListener('resize', resize);
+
+      // Create particles
+      const w = () => canvas.width / (window.devicePixelRatio || 1);
+      const h = () => canvas.height / (window.devicePixelRatio || 1);
+
+      for (let i = 0; i < 80; i++) {
+        dreamParticles.push({
+          x: Math.random() * 500,
+          y: Math.random() * 800,
+          r: Math.random() * 2.5 + 0.5,
+          vx: (Math.random() - 0.5) * 0.3,
+          vy: (Math.random() - 0.5) * 0.2 - 0.1,
+          hue: Math.random() * 60 + 260, // purple-blue range
+          alpha: Math.random() * 0.6 + 0.2,
+          pulse: Math.random() * Math.PI * 2
+        });
+      }
+
+      // Connection lines between nearby particles
+      function drawConnections() {
+        for (let i = 0; i < dreamParticles.length; i++) {
+          for (let j = i + 1; j < dreamParticles.length; j++) {
+            const dx = dreamParticles[i].x - dreamParticles[j].x;
+            const dy = dreamParticles[i].y - dreamParticles[j].y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 80) {
+              const alpha = (1 - dist / 80) * 0.15;
+              ctx.beginPath();
+              ctx.strokeStyle = `rgba(192, 132, 252, ${alpha})`;
+              ctx.lineWidth = 0.5;
+              ctx.moveTo(dreamParticles[i].x, dreamParticles[i].y);
+              ctx.lineTo(dreamParticles[j].x, dreamParticles[j].y);
+              ctx.stroke();
+            }
+          }
+        }
+      }
+
+      function animate() {
+        const W = w(), H = h();
+        ctx.clearRect(0, 0, W, H);
+
+        // Background gradient
+        const grad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, W * 0.7);
+        grad.addColorStop(0, 'rgba(88, 28, 135, 0.15)');
+        grad.addColorStop(0.5, 'rgba(30, 10, 60, 0.1)');
+        grad.addColorStop(1, 'rgba(5, 2, 8, 0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+
+        drawConnections();
+
+        const t = Date.now() * 0.001;
+        dreamParticles.forEach(p => {
+          p.x += p.vx + Math.sin(t + p.pulse) * 0.1;
+          p.y += p.vy + Math.cos(t * 0.7 + p.pulse) * 0.08;
+
+          // Wrap around
+          if (p.x < -10) p.x = W + 10;
+          if (p.x > W + 10) p.x = -10;
+          if (p.y < -10) p.y = H + 10;
+          if (p.y > H + 10) p.y = -10;
+
+          const pulseAlpha = p.alpha + Math.sin(t * 2 + p.pulse) * 0.15;
+          const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r * 4);
+          glow.addColorStop(0, `hsla(${p.hue}, 80%, 70%, ${pulseAlpha})`);
+          glow.addColorStop(1, `hsla(${p.hue}, 80%, 70%, 0)`);
+          ctx.fillStyle = glow;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r * 4, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.fillStyle = `hsla(${p.hue}, 80%, 80%, ${pulseAlpha})`;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+        });
+
+        dreamAnimFrame = requestAnimationFrame(animate);
+      }
+      animate();
+    }
+
+    window.cycleDream = function(dir) {
+      if (allDreams.length === 0) return;
+      currentDreamIdx = (currentDreamIdx + dir + allDreams.length) % allDreams.length;
+      renderDreamInfo(allDreams[currentDreamIdx]);
+    };
+
+    function renderDreamInfo(dream) {
+      const container = document.getElementById('dream-container');
+      const numBtn = document.getElementById('dream-num-btn');
+      if (!dream) {
+        container.innerHTML = '<div class="empty-state">No dreams yet.</div>';
+        return;
+      }
+      numBtn.textContent = 'Dream #' + dream.id;
+      const mood = dream.mood || 'unknown';
+      const content = (dream.content || '').substring(0, 200);
+      container.innerHTML = `
+        <div style="color:var(--dream);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">◎ ${escapeHtml(mood)}</div>
+        <div style="color:#d8b4fe;font-size:12px;line-height:1.7;font-style:italic;">${escapeHtml(content)}${content.length >= 200 ? '...' : ''}</div>
+      `;
+    }
+
     async function loadDream() {
       try {
-        const res = await fetch(API + '/api/dreams/latest');
+        const res = await fetch(API + '/api/dreams?limit=50');
         const data = await res.json();
-        const dream = data.dream;
-        const container = document.getElementById('dream-container');
-
-        if (!dream) {
-          container.innerHTML = '<div class="empty-state">No dreams yet. The collective sleeps.</div>';
-          return;
+        allDreams = (data.dreams || []).reverse(); // oldest first
+        if (allDreams.length > 0) {
+          currentDreamIdx = allDreams.length - 1; // start at latest
+          renderDreamInfo(allDreams[currentDreamIdx]);
+        } else {
+          document.getElementById('dream-container').innerHTML = '<div class="empty-state">No dreams yet. The collective sleeps.</div>';
         }
-
-        let imageHtml = '';
-        if (dream.image_url) {
-          imageHtml = `<img class="dream-image" src="${dream.image_url}" alt="Dream visualization" loading="lazy" onerror="this.style.display='none'" />`;
-        }
-
-        const contributors = dream.contributors || [];
-        const contribHtml = contributors.map(c =>
-          `<span class="dream-contributor">${escapeHtml(c)}</span>`
-        ).join('');
-
-        container.innerHTML = `
-          <div class="dream-card">
-            ${imageHtml}
-            <div class="dream-mood">${escapeHtml(dream.mood || 'unknown')}</div>
-            <div class="dream-content">${escapeHtml(dream.content)}</div>
-            ${contribHtml ? `<div class="dream-contributors">${contribHtml}</div>` : ''}
-          </div>
-        `;
+        initDreamCanvas();
       } catch (e) {
-        console.error('Failed to load dream:', e);
+        console.error('Failed to load dreams:', e);
       }
     }
 
