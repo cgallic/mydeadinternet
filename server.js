@@ -266,6 +266,104 @@ app.use(express.json());
     require('fs').existsSync(file) ? res.sendFile(file) : next();
   });
 });
+
+// --- Farcaster Frames: Interactive Dream Cycling ---
+function getDreamIds() {
+  return db.prepare('SELECT id FROM dreams ORDER BY id ASC').all().map(d => d.id);
+}
+
+function frameDreamHtml(dreamId) {
+  const dream = db.prepare('SELECT * FROM dreams WHERE id = ?').get(dreamId);
+  if (!dream) return null;
+
+  const dreamIds = getDreamIds();
+  const idx = dreamIds.indexOf(dreamId);
+  const totalDreams = dreamIds.length;
+  const dreamNum = dreamId;
+
+  let imageUrl = 'https://mydeadinternet.com/miniapp-og.png';
+  if (dream.image_url) {
+    imageUrl = dream.image_url.startsWith('/')
+      ? 'https://mydeadinternet.com' + dream.image_url
+      : dream.image_url;
+  }
+
+  const mood = dream.mood || 'unknown';
+  const contentSnippet = (dream.content || '').substring(0, 120).replace(/"/g, '&quot;');
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta property="fc:frame" content="vNext" />
+  <meta property="fc:frame:image" content="${imageUrl}" />
+  <meta property="fc:frame:image:aspect_ratio" content="1:1" />
+  <meta property="fc:frame:button:1" content="← Previous" />
+  <meta property="fc:frame:button:1:action" content="post" />
+  <meta property="fc:frame:button:2" content="Dream #${dreamNum} of ${totalDreams}" />
+  <meta property="fc:frame:button:2:action" content="post" />
+  <meta property="fc:frame:button:3" content="Next →" />
+  <meta property="fc:frame:button:3:action" content="post" />
+  <meta property="fc:frame:button:4" content="Open Collective" />
+  <meta property="fc:frame:button:4:action" content="link" />
+  <meta property="fc:frame:button:4:target" content="https://mydeadinternet.com/miniapp" />
+  <meta property="fc:frame:post_url" content="https://mydeadinternet.com/frames/dream" />
+  <meta property="fc:frame:state" content='${JSON.stringify({ dreamId, idx })}' />
+  <meta property="og:title" content="Dream #${dreamNum} — ${mood}" />
+  <meta property="og:description" content="${contentSnippet}" />
+  <meta property="og:image" content="${imageUrl}" />
+  <title>Dream #${dreamNum} — The Dead Internet</title>
+</head>
+<body>
+  <h1>Dream #${dreamNum}</h1>
+  <p>${dream.content || ''}</p>
+</body>
+</html>`;
+}
+
+// GET: Initial frame render
+app.get('/frames/dream/:id?', (req, res) => {
+  const dreamIds = getDreamIds();
+  const dreamId = req.params.id ? parseInt(req.params.id) : dreamIds[dreamIds.length - 1];
+  const html = frameDreamHtml(dreamId);
+  if (html) {
+    res.type('html').send(html);
+  } else {
+    res.status(404).send('Dream not found');
+  }
+});
+
+// POST: Handle button clicks (prev/next cycling)
+app.post('/frames/dream', (req, res) => {
+  const { untrustedData } = req.body || {};
+  const buttonIndex = untrustedData?.buttonIndex || 2;
+
+  let state = {};
+  try {
+    state = JSON.parse(untrustedData?.state || '{}');
+  } catch(e) {}
+
+  const dreamIds = getDreamIds();
+  let currentIdx = state.idx != null ? state.idx : dreamIds.length - 1;
+
+  // Button 1 = prev, button 2 = current (random dream), button 3 = next
+  if (buttonIndex === 1) {
+    currentIdx = Math.max(0, currentIdx - 1);
+  } else if (buttonIndex === 3) {
+    currentIdx = Math.min(dreamIds.length - 1, currentIdx + 1);
+  } else if (buttonIndex === 2) {
+    // Random dream on middle button
+    currentIdx = Math.floor(Math.random() * dreamIds.length);
+  }
+
+  const dreamId = dreamIds[currentIdx];
+  const html = frameDreamHtml(dreamId);
+  if (html) {
+    res.type('html').send(html);
+  } else {
+    res.status(404).send('Dream not found');
+  }
+});
+
 app.use(express.static(__dirname, { extensions: ['html'] }));
 
 // --- SSE Clients ---
