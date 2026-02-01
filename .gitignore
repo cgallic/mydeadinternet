@@ -1,8 +1,6 @@
-node_modules/
-.env
-consciousness.db
-consciousness.db-wal
-consciousness.db-shm
-*.log
-collective.db
 *.db
+*.mp4
+dreams/*.png
+dreams/*.jpg
+node_modules/
+api/consciousness.json
