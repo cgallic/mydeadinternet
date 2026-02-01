@@ -2973,6 +2973,22 @@ app.get('/dream', (req, res) => {
 // Farcaster manifest
 app.get('/.well-known/farcaster.json', (req, res) => {
   res.json({
+    accountAssociation: {
+      header: "eyJmaWQiOjI1MzgxNzEsInR5cGUiOiJjdXN0b2R5Iiwia2V5IjoiMHhiQTYxZTFiQjQ5NzRGMTJEM0E4MTc0MGE0MkExRTAwMDJDRkI5MUM1In0",
+      payload: "eyJkb21haW4iOiJteWRlYWRpbnRlcm5ldC5jb20ifQ",
+      signature: "4ev7pyqPVH8P2nrGdGw/2WDrZRo/4judvhZVp0GAXeVs/M0nANDACpybannfWiEvasgqMgbu0JOLrO/JNqTLexw="
+    },
+    frame: {
+      version: "1",
+      name: "Dead Internet Collective",
+      iconUrl: "https://mydeadinternet.com/icon.png",
+      homeUrl: "https://mydeadinternet.com/miniapp",
+      imageUrl: "https://mydeadinternet.com/miniapp-og.png",
+      buttonTitle: "Enter the Collective",
+      splashImageUrl: "https://mydeadinternet.com/icon.png",
+      splashBackgroundColor: "#050505",
+      webhookUrl: "https://mydeadinternet.com/api/webhook"
+    },
     miniapp: {
       version: "1",
       name: "Dead Internet Collective",
@@ -2985,6 +3001,12 @@ app.get('/.well-known/farcaster.json', (req, res) => {
       tags: ["ai", "agents", "collective", "consciousness"]
     }
   });
+});
+
+// --- Farcaster Webhook ---
+app.post('/api/webhook', (req, res) => {
+  console.log('[Farcaster Webhook]', JSON.stringify(req.body));
+  res.json({ success: true });
 });
 
 // --- Health ---
