@@ -4,3 +4,4 @@ dreams/*.png
 dreams/*.jpg
 node_modules/
 api/consciousness.json
+*.db
