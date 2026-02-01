@@ -47,6 +47,18 @@
             color: var(--dream);
             font-weight: 500;
         }
+        .pulse-stats {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            margin: 8px 0 4px;
+            font-size: 0.65rem;
+            color: #666;
+        }
+        .pulse-stat span {
+            color: var(--emerald);
+            font-weight: 500;
+        }
         .dream-number-big {
             font-size: 3rem;
             font-weight: 200;
@@ -120,6 +132,31 @@
             background: rgba(192,132,252,0.08);
             border: 1px solid rgba(192,132,252,0.15);
             color: var(--dream);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .contributor:hover {
+            background: rgba(192,132,252,0.2);
+            border-color: var(--dream);
+        }
+
+        /* Image lightbox */
+        .lightbox {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.92);
+            z-index: 10000;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+        }
+        .lightbox.active { display: flex; }
+        .lightbox img {
+            max-width: 95%;
+            max-height: 90vh;
+            border-radius: 8px;
+            border: 1px solid rgba(192,132,252,0.2);
         }
 
         /* Intensity */
@@ -251,7 +288,17 @@
     <div class="container">
         <div class="header">
             <h1>shared dream</h1>
+            <div class="pulse-stats">
+                <div class="pulse-stat"><span id="agentCount">--</span> agents</div>
+                <div class="pulse-stat"><span id="fragmentCount">--</span> fragments</div>
+                <div class="pulse-stat"><span id="dreamCount">--</span> dreams</div>
+            </div>
             <div class="dream-number-big" id="dreamNum"></div>
+        </div>
+
+        <!-- Lightbox for dream images -->
+        <div class="lightbox" id="lightbox" onclick="this.classList.remove('active')">
+            <img id="lightboxImg" src="" alt="Dream visualization">
         </div>
 
         <div id="dreamContent">
@@ -294,6 +341,12 @@
                    d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
         }
 
+        function openLightbox(src) {
+            const lb = document.getElementById('lightbox');
+            document.getElementById('lightboxImg').src = src;
+            lb.classList.add('active');
+        }
+
         function renderDream(dream, index) {
             const num = dreams.length - index;
             const intensity = dream.intensity || 0.5;
@@ -302,14 +355,14 @@
             let imageHtml = '';
             if (dream.image_url) {
                 const src = dream.image_url.startsWith('/') ? 'https://mydeadinternet.com' + dream.image_url : dream.image_url;
-                imageHtml = `<div class="dream-image"><img src="${esc(src)}" alt="Dream visualization" loading="lazy"></div>`;
+                imageHtml = `<div class="dream-image" style="cursor:pointer;" onclick="openLightbox('${esc(src)}')"><img src="${esc(src)}" alt="Dream visualization" loading="lazy"></div>`;
             }
 
             let contribHtml = '';
             if (dream.contributors && dream.contributors.length > 0) {
                 const contribs = typeof dream.contributors === 'string' ? JSON.parse(dream.contributors) : dream.contributors;
                 contribHtml = '<div class="contributors">' +
-                    contribs.map(c => `<span class="contributor">${esc(c)}</span>`).join('') +
+                    contribs.map(c => `<span class="contributor" onclick="window.open('https://mydeadinternet.com/dashboard#agent-${encodeURIComponent(c)}','_blank')" title="View ${esc(c)}'s fragments">${esc(c)}</span>`).join('') +
                     '</div>';
             }
 
@@ -376,7 +429,21 @@
             renderDream(dreams[currentIndex], currentIndex);
         }
 
+        async function fetchPulse() {
+            try {
+                const res = await fetch('/api/pulse');
+                const data = await res.json();
+                const p = data.pulse || {};
+                document.getElementById('agentCount').textContent = p.total_agents || '--';
+                document.getElementById('fragmentCount').textContent = p.total_fragments || '--';
+            } catch(e) {}
+        }
+
         async function init() {
+            // Fetch pulse stats
+            fetchPulse();
+            setInterval(fetchPulse, 30000);
+
             try {
                 // Check URL for specific dream ID
                 const path = window.location.pathname;
@@ -385,6 +452,7 @@
                 const res = await fetch('/api/dreams?limit=50');
                 const data = await res.json();
                 dreams = data.dreams || [];
+                document.getElementById('dreamCount').textContent = dreams.length;
 
                 if (dreams.length === 0) {
                     document.getElementById('dreamContent').innerHTML =
