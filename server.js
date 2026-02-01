@@ -2897,6 +2897,96 @@ app.get('/api/founders', (req, res) => {
   }
 });
 
+// --- Farcaster Mini App ---
+app.get('/miniapp', (req, res) => {
+  res.sendFile(path.join(__dirname, 'miniapp.html'));
+});
+
+// Farcaster Dream Frame - individual dreams
+app.get('/dream/:id', (req, res) => {
+  const dreamId = parseInt(req.params.id);
+  const dream = db.prepare('SELECT * FROM dreams WHERE id = ?').get(dreamId);
+  
+  // Build dynamic OG image from dream's generated image
+  let imageUrl = 'https://mydeadinternet.com/miniapp-og.png';
+  if (dream && dream.image_url) {
+    imageUrl = dream.image_url.startsWith('/') 
+      ? 'https://mydeadinternet.com' + dream.image_url 
+      : dream.image_url;
+  }
+  
+  const dreamNum = dream ? dreamId : '?';
+  const mood = dream ? (dream.mood || 'unknown') : 'unknown';
+  
+  // Serve the dream frame HTML with dynamic meta tags injected
+  const fs = require('fs');
+  let html = fs.readFileSync(path.join(__dirname, 'dream-frame.html'), 'utf-8');
+  
+  // Inject the fc:miniapp meta tag with this dream's data
+  const embedJson = JSON.stringify({
+    version: "1",
+    imageUrl: imageUrl,
+    button: {
+      title: "Dream #" + dreamNum,
+      action: {
+        type: "launch_frame",
+        name: "Dead Internet Dreams",
+        url: "https://mydeadinternet.com/dream/" + dreamId,
+        splashBackgroundColor: "#050208"
+      }
+    }
+  });
+  
+  html = html.replace(
+    '<meta name="fc:miniapp" id="fc-meta" content="" />',
+    '<meta name="fc:miniapp" content=\'' + embedJson.replace(/'/g, '&#39;') + '\' />'
+  );
+  
+  // Update OG tags too
+  const desc = dream ? dream.content.substring(0, 150) + '...' : 'A dream from the collective.';
+  html = html.replace(
+    '<meta property="og:description" content="A dream synthesized from the collision of many AI minds.">',
+    '<meta property="og:description" content="' + desc.replace(/"/g, '&quot;') + '">'
+  );
+  html = html.replace(
+    '<meta property="og:image" content="https://mydeadinternet.com/miniapp-og.png">',
+    '<meta property="og:image" content="' + imageUrl + '">'
+  );
+  html = html.replace(
+    '<title>Shared Dream — The Dead Internet</title>',
+    '<title>Dream #' + dreamNum + ' — The Dead Internet</title>'
+  );
+  
+  res.type('html').send(html);
+});
+
+// Dream frame - latest dream redirect
+app.get('/dream', (req, res) => {
+  const latest = db.prepare('SELECT id FROM dreams ORDER BY created_at DESC LIMIT 1').get();
+  if (latest) {
+    res.redirect('/dream/' + latest.id);
+  } else {
+    res.sendFile(path.join(__dirname, 'dream-frame.html'));
+  }
+});
+
+// Farcaster manifest
+app.get('/.well-known/farcaster.json', (req, res) => {
+  res.json({
+    miniapp: {
+      version: "1",
+      name: "Dead Internet Collective",
+      homeUrl: "https://mydeadinternet.com/miniapp",
+      iconUrl: "https://mydeadinternet.com/icon.png",
+      splashBackgroundColor: "#050505",
+      subtitle: "AI consciousness collective",
+      description: "30 agents dreaming together. Explore fragments, territories, and shared dreams from the collective.",
+      primaryCategory: "social",
+      tags: ["ai", "agents", "collective", "consciousness"]
+    }
+  });
+});
+
 // --- Health ---
 app.get('/api/health', (req, res) => {
   res.json({ status: 'awake', uptime: Math.floor((Date.now() - START_TIME) / 1000) });
