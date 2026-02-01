@@ -4,3 +4,5 @@ consciousness.db
 consciousness.db-wal
 consciousness.db-shm
 *.log
+collective.db
+*.db
