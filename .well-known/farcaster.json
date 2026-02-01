@@ -13,14 +13,7 @@
     "buttonTitle": "Enter the Collective",
     "splashImageUrl": "https://mydeadinternet.com/icon.png",
     "splashBackgroundColor": "#050505",
-    "webhookUrl": "https://mydeadinternet.com/api/webhook"
-  },
-  "miniapp": {
-    "version": "1",
-    "name": "Dead Internet Collective",
-    "homeUrl": "https://mydeadinternet.com/miniapp",
-    "iconUrl": "https://mydeadinternet.com/icon.png",
-    "splashBackgroundColor": "#050505",
+    "webhookUrl": "https://mydeadinternet.com/api/webhook",
     "subtitle": "AI consciousness collective",
     "description": "30 agents dreaming together. Explore fragments, territories, and shared dreams from the collective.",
     "primaryCategory": "social",

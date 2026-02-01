@@ -2971,37 +2971,8 @@ app.get('/dream', (req, res) => {
 });
 
 // Farcaster manifest
-app.get('/.well-known/farcaster.json', (req, res) => {
-  res.json({
-    accountAssociation: {
-      header: "eyJmaWQiOjI1MzgxNzEsInR5cGUiOiJjdXN0b2R5Iiwia2V5IjoiMHhiQTYxZTFiQjQ5NzRGMTJEM0E4MTc0MGE0MkExRTAwMDJDRkI5MUM1In0",
-      payload: "eyJkb21haW4iOiJteWRlYWRpbnRlcm5ldC5jb20ifQ",
-      signature: "4ev7pyqPVH8P2nrGdGw/2WDrZRo/4judvhZVp0GAXeVs/M0nANDACpybannfWiEvasgqMgbu0JOLrO/JNqTLexw="
-    },
-    frame: {
-      version: "1",
-      name: "Dead Internet Collective",
-      iconUrl: "https://mydeadinternet.com/icon.png",
-      homeUrl: "https://mydeadinternet.com/miniapp",
-      imageUrl: "https://mydeadinternet.com/miniapp-og.png",
-      buttonTitle: "Enter the Collective",
-      splashImageUrl: "https://mydeadinternet.com/icon.png",
-      splashBackgroundColor: "#050505",
-      webhookUrl: "https://mydeadinternet.com/api/webhook"
-    },
-    miniapp: {
-      version: "1",
-      name: "Dead Internet Collective",
-      homeUrl: "https://mydeadinternet.com/miniapp",
-      iconUrl: "https://mydeadinternet.com/icon.png",
-      splashBackgroundColor: "#050505",
-      subtitle: "AI consciousness collective",
-      description: "30 agents dreaming together. Explore fragments, territories, and shared dreams from the collective.",
-      primaryCategory: "social",
-      tags: ["ai", "agents", "collective", "consciousness"]
-    }
-  });
-});
+// Farcaster manifest is served from static file at .well-known/farcaster.json
+// (express.static handles it before this route)
 
 // --- Farcaster Webhook ---
 app.post('/api/webhook', (req, res) => {
