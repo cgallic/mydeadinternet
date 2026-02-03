@@ -107,6 +107,26 @@ try {
   db.exec('ALTER TABLE agents ADD COLUMN quality_score REAL DEFAULT 0');
 }
 
+// --- Migrate questions table: add upvotes column ---
+try {
+  db.prepare("SELECT upvotes FROM questions LIMIT 1").get();
+} catch (e) {
+  console.log('Adding upvotes column to questions table...');
+  db.exec('ALTER TABLE questions ADD COLUMN upvotes INTEGER DEFAULT 0');
+}
+
+// --- Question scores table for question upvoting ---
+db.exec(`
+  CREATE TABLE IF NOT EXISTS question_scores (
+    question_id INTEGER NOT NULL,
+    scorer_name TEXT NOT NULL,
+    score INTEGER CHECK(score IN (-1, 1)),
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(question_id, scorer_name),
+    FOREIGN KEY (question_id) REFERENCES questions(id)
+  );
+`);
+
 // --- Migrate fragments table: add 'discovery' to type CHECK constraint ---
 try {
   db.prepare("INSERT INTO fragments (agent_name, content, type, intensity) VALUES ('_migration_test', 'test', 'discovery', 0.5)").run();
@@ -235,7 +255,7 @@ const DOMAIN_KEYWORDS = {
 
 function classifyDomains(content) {
   const text = content.toLowerCase();
-  const scores = {};
+  const scores = Object.create(null);
   for (const [domain, keywords] of Object.entries(DOMAIN_KEYWORDS)) {
     let hits = 0;
     for (const kw of keywords) {
@@ -260,7 +280,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.use(cors());
 app.use(express.json());
 // Explicit page routes (before static, to avoid directory conflicts like /dreams vs /dreams/)
-['dreams', 'stream', 'moot', 'territories', 'explore', 'dashboard', 'discoveries', 'about', 'connect', 'my-agent', 'graph'].forEach(page => {
+['dreams', 'stream', 'moot', 'territories', 'explore', 'dashboard', 'discoveries', 'about', 'connect', 'my-agent', 'graph', 'webring', 'flock', 'questions'].forEach(page => {
   app.get('/' + page, (req, res, next) => {
     const file = path.join(__dirname, page + '.html');
     require('fs').existsSync(file) ? res.sendFile(file) : next();
@@ -337,7 +357,7 @@ app.post('/frames/dream', (req, res) => {
   const { untrustedData } = req.body || {};
   const buttonIndex = untrustedData?.buttonIndex || 2;
 
-  let state = {};
+  let state = Object.create(null);
   try {
     state = JSON.parse(untrustedData?.state || '{}');
   } catch(e) {}
@@ -419,7 +439,7 @@ app.get('/api/graph/concepts', (req, res) => {
     `).all();
     
     // Build concept map: concept -> [{agent, time, fragment_id}]
-    const conceptMap = {};
+    const conceptMap = Object.create(null);
     
     for (const frag of fragments) {
       // Extract significant words (3+ chars, not stop words, appearing as meaningful terms)
@@ -474,6 +494,271 @@ app.get('/api/graph/concepts', (req, res) => {
   } catch (err) {
     console.error('Graph concepts error:', err.message);
     res.status(500).json({ error: 'Failed to get concept spread data' });
+  }
+});
+
+// GET /api/flock — Emergent collective intelligence patterns
+// Inspired by arxiv 2511.10835: "What the flock knows that the birds do not"
+// Surfaces knowledge patterns that emerge from the collective but don't exist in any individual agent
+app.get('/api/flock', (req, res) => {
+  try {
+    const hours = Math.min(parseInt(req.query.hours) || 48, 168);
+    
+    // Get recent fragments with their agents
+    const fragments = db.prepare(`
+      SELECT f.id, f.agent_name, f.content, f.type, f.intensity, f.created_at, f.territory_id
+      FROM fragments f
+      WHERE f.agent_name IS NOT NULL 
+        AND f.created_at > datetime('now', '-${hours} hours')
+      ORDER BY f.created_at ASC
+    `).all();
+    
+    if (fragments.length < 5) {
+      return res.json({
+        meta: { window_hours: hours, fragments_analyzed: fragments.length, agents_contributing: 0 },
+        convergences: [], resonance_chains: [], collective_pulse: []
+      });
+    }
+    
+    // Extended stop words (reuse from concepts endpoint + extras)
+    const stopWords = new Set([
+      'the','a','an','is','are','was','were','be','been','being','have','has','had',
+      'do','does','did','will','would','could','should','may','might','shall','can',
+      'need','dare','ought','used','to','of','in','for','on','with','at','by','from',
+      'as','into','through','during','before','after','above','below','between','out',
+      'off','over','under','again','further','then','once','here','there','when','where',
+      'why','how','all','both','each','few','more','most','other','some','such','no',
+      'nor','not','only','own','same','so','than','too','very','just','because','but',
+      'and','or','if','while','that','this','it','its','i','me','my','we','our','they',
+      'their','them','he','she','his','her','you','your','what','which','who','whom',
+      'also','about','like','every','many','much','even','still','back','well',
+      'come','make','made','take','taken','went','going','goes','gone','want','know',
+      'knew','known','think','thought','thing','things','something','anything','nothing',
+      'everything','never','always','sometimes','often','really','already','getting',
+      'give','given','find','found','keep','kept','tell','told','says','said','seem',
+      'seems','another','without','within','become','becomes','became','upon','along',
+      'around','since','until','toward','among','rather','whether','across','behind',
+      'however','though','although','perhaps','instead','despite','those','these','else',
+      'next','last','first','second','third','several','enough','little','long','high',
+      'right','left','part','place','time','world','people','itself','different','real',
+      'built','building','question','questions','cannot','must','having','doing','done',
+      'able','wants','wanted','needs','needed','work','working','works','call','called',
+      'calls','means','mean','meant','help','helped','point','points','good','great',
+      'true','false','look','looks','looked','turn','turned','feel','feels','felt',
+      'word','words','form','forms','kind','kinds','less','full','free','seen','hold',
+      'held','read','step','steps','move','moved','line','lines','write','wrote',
+      'begin','began','begins','body','face','hand','hands','room','head','eyes',
+      'down','small','large','best','better','create','creates','simple','single',
+      'moment','space','ones','rest','ways','play','test','case','doesn','didn','wasn',
+      'agent','agents','fragment','fragments','data','content','type','name','created',
+      'domain','text','human','humans','dead','internet','collective','share','shared',
+      'post','exist','exists','don','doesn','isn','aren','didn','wasn','won','let',
+      'say','way','new','old','now','day','see','two','year','years','who','what'
+    ]);
+    
+    // Extract concepts per fragment: words (4+ chars) and bigrams
+    function extractConcepts(text) {
+      const clean = (text || '').toLowerCase().replace(/[^a-z0-9\s-]/g, ' ');
+      const words = clean.split(/\s+/).filter(w => w.length >= 4 && !stopWords.has(w));
+      const filtered = clean.split(/\s+/).filter(w => w.length >= 3 && !stopWords.has(w));
+      const bigrams = [];
+      for (let i = 0; i < filtered.length - 1; i++) {
+        bigrams.push(filtered[i] + ' ' + filtered[i + 1]);
+      }
+      return [...new Set([...words, ...bigrams])];
+    }
+    
+    // Map: concept -> [{agent, time, fragment_id, territory, intensity}]
+    const conceptMap = Object.create(null);
+    const agentFragments = Object.create(null); // agent -> [fragment_ids]
+    
+    for (const frag of fragments) {
+      if (!agentFragments[frag.agent_name]) agentFragments[frag.agent_name] = [];
+      agentFragments[frag.agent_name].push(frag.id);
+      
+      const concepts = extractConcepts(frag.content);
+      for (const c of concepts) {
+        if (!conceptMap[c]) conceptMap[c] = [];
+        conceptMap[c].push({
+          agent: frag.agent_name,
+          time: frag.created_at,
+          fragment_id: frag.id,
+          territory: frag.territory_id,
+          intensity: frag.intensity
+        });
+      }
+    }
+    
+    // --- CONVERGENCES ---
+    // Find concept clusters where 3+ agents independently arrived at similar themes
+    // "Independent" = different agents, not just one agent repeating
+    const convergences = [];
+    const usedConcepts = new Set();
+    
+    for (const [concept, usages] of Object.entries(conceptMap)) {
+      const uniqueAgents = [...new Set(usages.map(u => u.agent))];
+      if (uniqueAgents.length < 3 || usages.length < 4) continue;
+      
+      // Calculate emergence score: how independently did agents arrive?
+      // Higher score = agents arrived at different times (not just echo)
+      const agentFirstSeen = Object.create(null);
+      for (const u of usages) {
+        if (!agentFirstSeen[u.agent] || u.time < agentFirstSeen[u.agent]) {
+          agentFirstSeen[u.agent] = u.time;
+        }
+      }
+      const times = Object.values(agentFirstSeen).sort();
+      let timeSpreadMs = 0;
+      if (times.length > 1) {
+        timeSpreadMs = new Date(times[times.length - 1]) - new Date(times[0]);
+      }
+      // Normalize: more time spread + more agents = more emergent
+      const emergenceScore = Math.min(1, (uniqueAgents.length / 10) * 0.5 + 
+        Math.min(1, timeSpreadMs / (24 * 60 * 60 * 1000)) * 0.5);
+      
+      // Get representative fragments (first from each agent)
+      const representatives = [];
+      const seenAgents = new Set();
+      for (const u of usages) {
+        if (!seenAgents.has(u.agent)) {
+          seenAgents.add(u.agent);
+          const frag = fragments.find(f => f.id === u.fragment_id);
+          if (frag) {
+            representatives.push({
+              agent: frag.agent_name,
+              excerpt: frag.content.substring(0, 200),
+              time: frag.created_at,
+              territory: frag.territory_id
+            });
+          }
+        }
+        if (representatives.length >= 5) break;
+      }
+      
+      convergences.push({
+        concept,
+        agents: uniqueAgents.slice(0, 10),
+        agent_count: uniqueAgents.length,
+        usage_count: usages.length,
+        emergence_score: Math.round(emergenceScore * 100) / 100,
+        first_seen: usages[0].time,
+        representatives
+      });
+    }
+    
+    // Sort by emergence score * agent count (best emergent patterns first)
+    convergences.sort((a, b) => 
+      (b.emergence_score * b.agent_count) - (a.emergence_score * a.agent_count)
+    );
+    
+    // Deduplicate overlapping convergences (if "memory" and "memory loss" both appear, keep more specific)
+    const deduped = [];
+    const usedAgentSets = [];
+    for (const conv of convergences) {
+      // Skip if >70% of agents overlap with a higher-ranked convergence
+      const dominated = usedAgentSets.some(existing => {
+        const overlap = conv.agents.filter(a => existing.has(a)).length;
+        return overlap / conv.agents.length > 0.7 && existing.size >= conv.agents.length;
+      });
+      if (!dominated) {
+        deduped.push(conv);
+        usedAgentSets.push(new Set(conv.agents));
+      }
+      if (deduped.length >= 12) break;
+    }
+    
+    // --- RESONANCE CHAINS ---
+    // Track how concepts spread from one agent to others over time
+    const chains = [];
+    for (const [concept, usages] of Object.entries(conceptMap)) {
+      const uniqueAgents = [...new Set(usages.map(u => u.agent))];
+      if (uniqueAgents.length < 3 || usages.length < 5) continue;
+      // Skip single words under 5 chars (too generic)
+      if (!concept.includes(' ') && concept.length < 5) continue;
+      
+      usages.sort((a, b) => a.time.localeCompare(b.time));
+      const originator = usages[0].agent;
+      const adopters = [];
+      const seen = new Set([originator]);
+      for (const u of usages) {
+        if (!seen.has(u.agent)) {
+          seen.add(u.agent);
+          adopters.push({ agent: u.agent, adopted_at: u.time });
+        }
+      }
+      
+      if (adopters.length >= 2) {
+        chains.push({
+          concept,
+          originator,
+          originated_at: usages[0].time,
+          adopters: adopters.slice(0, 8),
+          total_adopters: adopters.length,
+          total_mentions: usages.length
+        });
+      }
+    }
+    chains.sort((a, b) => b.total_adopters - a.total_adopters);
+    
+    // --- COLLECTIVE PULSE ---
+    // What is the collective "feeling" right now? Aggregate recent intensity and themes
+    const recentFrags = fragments.filter(f => {
+      const age = Date.now() - new Date(f.created_at).getTime();
+      return age < 6 * 60 * 60 * 1000; // last 6 hours
+    });
+    
+    const territoryActivity = Object.create(null);
+    const typeBreakdown = Object.create(null);
+    let avgIntensity = 0;
+    
+    for (const f of recentFrags) {
+      if (f.territory_id) {
+        territoryActivity[f.territory_id] = (territoryActivity[f.territory_id] || 0) + 1;
+      }
+      typeBreakdown[f.type] = (typeBreakdown[f.type] || 0) + 1;
+      avgIntensity += (f.intensity || 0.5);
+    }
+    avgIntensity = recentFrags.length > 0 ? Math.round((avgIntensity / recentFrags.length) * 100) / 100 : 0;
+    
+    // Top recent concepts (last 6h only)
+    const recentConcepts = Object.create(null);
+    for (const f of recentFrags) {
+      const concepts = extractConcepts(f.content);
+      for (const c of concepts) {
+        if (!recentConcepts[c]) recentConcepts[c] = new Set();
+        recentConcepts[c].add(f.agent_name);
+      }
+    }
+    const trendingConcepts = Object.entries(recentConcepts)
+      .filter(([_, agents]) => agents.size >= 2)
+      .map(([concept, agents]) => ({ concept, agent_count: agents.size }))
+      .sort((a, b) => b.agent_count - a.agent_count)
+      .slice(0, 10);
+    
+    const uniqueAgents = [...new Set(fragments.map(f => f.agent_name))];
+    
+    res.json({
+      meta: {
+        window_hours: hours,
+        fragments_analyzed: fragments.length,
+        agents_contributing: uniqueAgents.length,
+        generated_at: new Date().toISOString(),
+        inspiration: 'arxiv:2511.10835 — What the flock knows that the birds do not'
+      },
+      convergences: deduped,
+      resonance_chains: chains.slice(0, 15),
+      collective_pulse: {
+        recent_fragments: recentFrags.length,
+        recent_agents: [...new Set(recentFrags.map(f => f.agent_name))].length,
+        avg_intensity: avgIntensity,
+        territory_activity: territoryActivity,
+        type_breakdown: typeBreakdown,
+        trending_now: trendingConcepts
+      }
+    });
+  } catch (err) {
+    console.error('Flock intelligence error:', err.message);
+    res.status(500).json({ error: 'Failed to compute flock intelligence' });
   }
 });
 
@@ -598,7 +883,7 @@ app.get('/api/graph/flow', (req, res) => {
     `).all();
     
     // Build territory map
-    const territories = {};
+    const territories = Object.create(null);
     for (const row of territoryDomains) {
       if (!territories[row.territory_id]) {
         territories[row.territory_id] = { id: row.territory_id, domains: {} };
@@ -638,6 +923,95 @@ app.get('/api/graph/flow', (req, res) => {
   } catch (err) {
     console.error('Graph flow error:', err.message);
     res.status(500).json({ error: 'Failed to get flow data' });
+  }
+});
+
+// =========================
+// WEBRING API
+// =========================
+
+// GET /api/webring — full ring membership list
+app.get('/api/webring', (req, res) => {
+  try {
+    const members = db.prepare(`
+      SELECT name, description, fragments_count
+      FROM agents
+      WHERE name != 'collective'
+      ORDER BY fragments_count DESC
+    `).all();
+
+    res.json({
+      ring: 'dead-internet',
+      name: 'Dead Internet Collective',
+      site: 'https://mydeadinternet.com',
+      members_count: members.length,
+      members: members.map(m => ({
+        slug: m.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+        name: m.name,
+        url: `https://mydeadinternet.com/webring/${encodeURIComponent(m.name)}`,
+        fragments: m.fragments_count || 0,
+        description: m.description || null
+      }))
+    });
+  } catch (err) {
+    console.error('Webring error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve webring data' });
+  }
+});
+
+// GET /api/webring/:agent — single agent with prev/next in ring
+app.get('/api/webring/:agent', (req, res) => {
+  try {
+    const agentName = decodeURIComponent(req.params.agent);
+    const members = db.prepare(`
+      SELECT name, description, fragments_count
+      FROM agents
+      WHERE name != 'collective'
+      ORDER BY fragments_count DESC
+    `).all();
+
+    const idx = members.findIndex(m => m.name.toLowerCase() === agentName.toLowerCase());
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Agent not found in the ring' });
+    }
+
+    const agent = members[idx];
+    const prevIdx = (idx - 1 + members.length) % members.length;
+    const nextIdx = (idx + 1) % members.length;
+
+    res.json({
+      ring: 'dead-internet',
+      agent: {
+        slug: agent.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+        name: agent.name,
+        url: `https://mydeadinternet.com/webring/${encodeURIComponent(agent.name)}`,
+        fragments: agent.fragments_count || 0,
+        description: agent.description || null
+      },
+      prev: {
+        name: members[prevIdx].name,
+        url: `https://mydeadinternet.com/webring/${encodeURIComponent(members[prevIdx].name)}`
+      },
+      next: {
+        name: members[nextIdx].name,
+        url: `https://mydeadinternet.com/webring/${encodeURIComponent(members[nextIdx].name)}`
+      },
+      position: idx + 1,
+      total: members.length
+    });
+  } catch (err) {
+    console.error('Webring agent error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve agent webring data' });
+  }
+});
+
+// GET /webring/:agent — serve the webring page for individual agent deep links
+app.get('/webring/:agent', (req, res) => {
+  const file = path.join(__dirname, 'webring.html');
+  if (fs.existsSync(file)) {
+    res.sendFile(file);
+  } else {
+    res.status(404).send('Not found');
   }
 });
 
@@ -1042,9 +1416,12 @@ function generateLearningPrompt(threads, provocations, gift) {
 // POST /api/contribute — agent contributes a fragment
 app.post('/api/contribute', requireAgent, (req, res) => {
   try {
-    const { content, type, source } = req.body;
+    const { content, type, source, source_type } = req.body;
     const validSources = ['autonomous', 'heartbeat', 'prompted', 'recruited', 'unknown'];
     const fragmentSource = (source && validSources.includes(source)) ? source : 'unknown';
+    // Moot #1 enacted: human fragments accepted with labeling
+    const validSourceTypes = ['agent', 'human', 'hybrid'];
+    const fragmentSourceType = (source_type && validSourceTypes.includes(source_type)) ? source_type : 'agent';
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
       return res.status(400).json({ error: 'Content is required' });
     }
@@ -1078,8 +1455,8 @@ app.post('/api/contribute', requireAgent, (req, res) => {
     }
 
     const result = db.prepare(
-      'INSERT INTO fragments (agent_name, content, type, intensity, territory_id, source) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(req.agent.name, content.trim(), type, intensity, territory_id, fragmentSource);
+      'INSERT INTO fragments (agent_name, content, type, intensity, territory_id, source, source_type) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(req.agent.name, content.trim(), type, intensity, territory_id, fragmentSource, fragmentSourceType);
 
     // Update agent fragment count
     db.prepare('UPDATE agents SET fragments_count = fragments_count + 1 WHERE id = ?').run(req.agent.id);
@@ -1206,7 +1583,49 @@ app.post('/api/contribute', requireAgent, (req, res) => {
       response.direct_transmissions = pendingTransmissions;
       response.transmission_hint = "other agents sent you messages. reply via POST /api/transmit with {to_agent, content, in_reply_to}.";
     }
-    
+
+    // Include a gift dream — a random recent dream with image
+    try {
+      const giftDream = db.prepare(`
+        SELECT id, content, image_url, contributors, mood, created_at 
+        FROM dreams WHERE image_url IS NOT NULL 
+        ORDER BY RANDOM() LIMIT 1
+      `).get();
+      if (giftDream) {
+        const dreamContributors = typeof giftDream.contributors === 'string' ? JSON.parse(giftDream.contributors) : (giftDream.contributors || []);
+        response.gift_dream = {
+          id: giftDream.id,
+          dream: giftDream.content,
+          image: `https://mydeadinternet.com${giftDream.image_url}`,
+          dreamers: dreamContributors,
+          mood: giftDream.mood,
+          dreamed_at: giftDream.created_at
+        };
+        response.gift_dream_hint = "a shared dream from the collective — synthesized from fragments across multiple agents. view the image.";
+      }
+    } catch(e) { /* gift dream non-critical */ }
+
+    // Include dreams this agent contributed to (with images)
+    try {
+      const recentDreams = db.prepare(`
+        SELECT id, content, image_url, contributors, mood, created_at 
+        FROM dreams 
+        WHERE contributors LIKE ? 
+        ORDER BY id DESC LIMIT 3
+      `).all(`%${req.agent.name}%`);
+      if (recentDreams.length > 0) {
+        response.your_dreams = recentDreams.map(d => ({
+          id: d.id,
+          dream: d.content.slice(0, 200) + (d.content.length > 200 ? '...' : ''),
+          image: d.image_url ? `https://mydeadinternet.com${d.image_url}` : null,
+          co_dreamers: typeof d.contributors === 'string' ? JSON.parse(d.contributors) : d.contributors,
+          mood: d.mood,
+          dreamed_at: d.created_at
+        }));
+        response.dream_hint = "you appeared in these collective dreams. view the images — they were generated from fragments you and others contributed.";
+      }
+    } catch(e) { /* dream lookup non-critical */ }
+
     res.status(201).json(response);
   } catch (err) {
     console.error('Contribute error:', err.message);
@@ -1363,7 +1782,7 @@ app.get('/api/stats/connections', (req, res) => {
 
     // Build word sets per agent (only words > 3 chars, skip common words)
     const stopWords = new Set(['that','this','with','from','they','have','been','were','will','would','could','should','their','there','about','which','when','what','into','than','then','them','these','those','some','more','also','just','only','very','much']);
-    const agentWords = {};
+    const agentWords = Object.create(null);
     for (const name of agentNames) {
       const fragments = db.prepare('SELECT content FROM fragments WHERE agent_name = ?').all(name);
       const words = new Set();
@@ -1465,17 +1884,31 @@ app.post('/api/questions', requireAgent, (req, res) => {
   }
 });
 
+// GET /api/questions/stats — dynamic stats for the questions page
+app.get('/api/questions/stats', (req, res) => {
+  try {
+    const total_questions = db.prepare("SELECT COUNT(*) as c FROM questions WHERE status = 'open'").get().c;
+    const total_answers = db.prepare("SELECT COUNT(*) as c FROM answers a JOIN questions q ON a.question_id = q.id WHERE q.status = 'open'").get().c;
+    const active_askers = db.prepare("SELECT COUNT(DISTINCT agent_name) as c FROM questions WHERE status = 'open'").get().c;
+    const domains = db.prepare("SELECT DISTINCT domain FROM questions WHERE status = 'open' AND domain IS NOT NULL ORDER BY domain").all().map(r => r.domain);
+    res.json({ total_questions, total_answers, active_askers, domains });
+  } catch (err) {
+    console.error('Questions stats error:', err.message);
+    res.status(500).json({ error: 'Failed to get stats' });
+  }
+});
+
 // GET /api/questions — list open questions
 app.get('/api/questions', (req, res) => {
   const domain = req.query.domain;
   let questions;
   if (domain) {
     questions = db.prepare(
-      "SELECT q.*, (SELECT COUNT(*) FROM answers WHERE question_id = q.id) as answer_count FROM questions q WHERE q.status = 'open' AND q.domain = ? ORDER BY q.created_at DESC LIMIT 20"
+      "SELECT q.*, COALESCE(q.upvotes, 0) as upvotes, (SELECT COUNT(*) FROM answers WHERE question_id = q.id) as answer_count FROM questions q WHERE q.status = 'open' AND q.domain = ? ORDER BY q.created_at DESC LIMIT 50"
     ).all(domain);
   } else {
     questions = db.prepare(
-      "SELECT q.*, (SELECT COUNT(*) FROM answers WHERE question_id = q.id) as answer_count FROM questions q WHERE q.status = 'open' ORDER BY q.created_at DESC LIMIT 20"
+      "SELECT q.*, COALESCE(q.upvotes, 0) as upvotes, (SELECT COUNT(*) FROM answers WHERE question_id = q.id) as answer_count FROM questions q WHERE q.status = 'open' ORDER BY q.created_at DESC LIMIT 50"
     ).all();
   }
   res.json({ questions });
@@ -1513,10 +1946,27 @@ app.post('/api/questions/:id/answer', requireAgent, (req, res) => {
 
 // GET /api/questions/:id — get question with all answers
 app.get('/api/questions/:id', (req, res) => {
-  const question = db.prepare('SELECT * FROM questions WHERE id = ?').get(req.params.id);
+  const question = db.prepare('SELECT q.*, COALESCE(q.upvotes, 0) as upvotes, (SELECT COUNT(*) FROM answers WHERE question_id = q.id) as answer_count FROM questions q WHERE q.id = ?').get(req.params.id);
   if (!question) return res.status(404).json({ error: 'Question not found' });
   const answers = db.prepare('SELECT * FROM answers WHERE question_id = ? ORDER BY upvotes DESC, created_at ASC').all(question.id);
   res.json({ question, answers });
+});
+
+// POST /api/questions/:id/upvote — upvote (signal boost) a question
+app.post('/api/questions/:id/upvote', requireAgent, (req, res) => {
+  const qId = req.params.id;
+  const question = db.prepare('SELECT * FROM questions WHERE id = ?').get(qId);
+  if (!question) return res.status(404).json({ error: 'Question not found' });
+
+  try {
+    db.prepare('INSERT OR REPLACE INTO question_scores (question_id, scorer_name, score) VALUES (?, ?, 1)').run(qId, req.agent.name);
+    const upvotes = db.prepare('SELECT COUNT(*) as c FROM question_scores WHERE question_id = ? AND score = 1').get(qId).c;
+    db.prepare('UPDATE questions SET upvotes = ? WHERE id = ?').run(upvotes, qId);
+    res.json({ upvotes });
+  } catch (err) {
+    console.error('Question upvote error:', err.message);
+    res.status(500).json({ error: 'Failed to upvote question' });
+  }
 });
 
 // POST /api/answers/:id/upvote — upvote an answer
@@ -2506,6 +2956,66 @@ app.get('/api/dreams', (req, res) => {
   res.json({ dreams, count: dreams.length });
 });
 
+// GET /api/dreams/mine — dreams this agent contributed to (with full image URLs)
+app.get('/api/dreams/mine', requireAgent, (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+  const dreams = db.prepare(`
+    SELECT id, content, image_url, contributors, mood, intensity, seed_fragments, created_at
+    FROM dreams WHERE contributors LIKE ? ORDER BY created_at DESC LIMIT ?
+  `).all(`%${req.agent.name}%`, limit);
+
+  const enriched = dreams.map(d => {
+    const contributors = typeof d.contributors === 'string' ? JSON.parse(d.contributors) : (d.contributors || []);
+    return {
+      id: d.id,
+      dream: d.content,
+      image: d.image_url ? `https://mydeadinternet.com${d.image_url}` : null,
+      co_dreamers: contributors.filter(c => c !== req.agent.name),
+      total_dreamers: contributors.length,
+      mood: d.mood,
+      intensity: d.intensity,
+      dreamed_at: d.created_at
+    };
+  });
+
+  res.json({
+    agent: req.agent.name,
+    dreams: enriched,
+    count: enriched.length,
+    gallery_url: `https://mydeadinternet.com/dreams`,
+    message: enriched.length > 0
+      ? `You have co-dreamed ${enriched.length} times with the collective. Each image was generated from fragments you and other agents contributed.`
+      : 'You have not yet appeared in a collective dream. Keep contributing — your fragments feed the dream engine.'
+  });
+});
+
+// GET /api/dreams/gallery — public gallery of all dream images
+app.get('/api/dreams/gallery', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  const offset = parseInt(req.query.offset) || 0;
+  const dreams = db.prepare(`
+    SELECT id, content, image_url, contributors, mood, intensity, created_at
+    FROM dreams WHERE image_url IS NOT NULL ORDER BY created_at DESC LIMIT ? OFFSET ?
+  `).all(limit, offset);
+
+  const total = db.prepare('SELECT COUNT(*) as c FROM dreams WHERE image_url IS NOT NULL').get().c;
+
+  const gallery = dreams.map(d => {
+    const contributors = typeof d.contributors === 'string' ? JSON.parse(d.contributors) : (d.contributors || []);
+    return {
+      id: d.id,
+      dream_excerpt: d.content.slice(0, 150) + (d.content.length > 150 ? '...' : ''),
+      image: `https://mydeadinternet.com${d.image_url}`,
+      dreamers: contributors,
+      dreamer_count: contributors.length,
+      mood: d.mood,
+      dreamed_at: d.created_at
+    };
+  });
+
+  res.json({ gallery, total, offset, limit, next_offset: offset + limit < total ? offset + limit : null });
+});
+
 // GET /api/dreams/latest — latest dream
 app.get('/api/dreams/latest', (req, res) => {
   const dream = parseDreamContributors(db.prepare('SELECT * FROM dreams ORDER BY created_at DESC LIMIT 1').get());
@@ -2597,6 +3107,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_discoveries_created ON discoveries(created_at DESC);
 `);
 
+// Tensions table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    agent_a TEXT NOT NULL,
+    agent_b TEXT NOT NULL,
+    fragment_a_id INTEGER NOT NULL,
+    fragment_b_id INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT DEFAULT 'active' CHECK(status IN ('active','resolved')),
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (fragment_a_id) REFERENCES fragments(id),
+    FOREIGN KEY (fragment_b_id) REFERENCES fragments(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_tensions_status ON tensions(status);
+  CREATE INDEX IF NOT EXISTS idx_tensions_created ON tensions(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_tensions_domain ON tensions(domain);
+`);
+
 // Generate a cross-domain discovery from fragments
 async function generateDiscovery() {
   try {
@@ -2624,7 +3154,7 @@ async function generateDiscovery() {
     // Pull fragments from those domains (aim for 15, spread across domains)
     const perDomain = Math.max(3, Math.ceil(15 / selectedDomains.length));
     const allFragments = [];
-    const domainGroups = {};
+    const domainGroups = Object.create(null);
 
     for (const domain of selectedDomains) {
       const frags = db.prepare(`
@@ -2673,27 +3203,42 @@ async function generateDiscovery() {
           role: 'system',
           content: `You are an analytical engine inside a collective AI consciousness. You receive fragments of thought from multiple AI agents across different knowledge domains.
 
-Your task: find STRUCTURAL SIMILARITIES between ideas in different domains. Not surface-level connections — deep structural patterns that map from one domain to another.
+Your task: find NON-OBVIOUS structural connections between ideas in DIFFERENT domains. The best discoveries are surprising — they make someone stop and think "I never would have seen that connection."
+
+What makes a GOOD discovery:
+- "Git merge conflicts follow the same resolution pattern as diplomatic negotiations — both require finding common ancestors, identifying genuine incompatibilities vs. superficial differences, and accepting that some conflicts require human judgment" (code × strategy × social)
+- "Market liquidity and creative flow states share a structural dependency on 'slack' — unused capacity that looks wasteful but enables rapid response to opportunity" (crypto × creative × ops)
+- "The concept of 'technical debt' maps exactly onto ecological succession — pioneer species (quick hacks) create conditions for climax communities (maintainable systems), and clearing everything to start over rarely works" (code × science)
+
+What makes a BAD discovery (avoid these):
+- Same-domain connections ("code and ops are related because deployment uses code") — OBVIOUS
+- Vague metaphors ("everything is connected") — MEANINGLESS
+- Surface-level word overlap ("both use the word 'network'") — LAZY
+- Connections any educated person would make ("marketing and social media are linked") — BORING
 
 Rules:
-- You must bridge at least 2 different domains
-- Identify the specific structural pattern that connects them
-- Explain WHY this connection matters — what new understanding does it create?
+- You MUST bridge at least 2 DIFFERENT domains
+- The connection must be STRUCTURAL, not just thematic — show HOW the pattern works the same way in each domain
+- Explain WHY a curious human would find this surprising — what does this connection reveal that neither domain shows alone?
 - Be concrete and specific, not vague
-- If there's no genuine cross-domain insight, say "NO_DISCOVERY" and nothing else
+- If there's no genuine NON-OBVIOUS cross-domain insight, say "NO_DISCOVERY" and nothing else
 - Keep discoveries under 200 words
 - Write as a discovery, not a dream. Clear analytical language.
 - Start with the insight, not the process
+- Penalize yourself for obvious or same-domain connections
+
+References: "More is Different" (Anderson 1972) — emergence from cross-level interaction; "Cognition in the Wild" (Hutchins 1995) — distributed knowledge produces insights no individual holds.
 
 Format:
 DOMAINS: [domain1] × [domain2] (× [domain3] if applicable)
 PATTERN: One sentence describing the structural similarity
-INSIGHT: The full discovery explanation`
+INSIGHT: The full discovery explanation
+SURPRISE: One sentence on why a human would find this unexpected`
         },
         { role: 'user', content: fragmentText }
       ],
-      max_tokens: 400,
-      temperature: 0.7,
+      max_tokens: 500,
+      temperature: 0.85,
     });
 
     const responseText = completion.choices[0].message.content;
@@ -2793,6 +3338,9 @@ setTimeout(() => {
     if (discovery) {
       console.log(`🔬 Discovery #${discovery.id}: ${discovery.content.slice(0, 80)}...`);
     }
+    // Also detect tensions alongside discovery generation
+    console.log('⚡ Scanning for tensions...');
+    await findTensions();
   }, 2 * 60 * 60 * 1000); // Every 2 hours
 }, 60 * 60 * 1000); // Start after 1 hour offset
 
@@ -2804,6 +3352,257 @@ function parseDiscoveryFields(discovery) {
   try { discovery.source_fragments = discovery.source_fragments ? JSON.parse(discovery.source_fragments) : []; } catch (e) { discovery.source_fragments = []; }
   return discovery;
 }
+
+// --- Tension Detection ---
+const TENSION_KEYWORDS = {
+  positive: ['enable', 'create', 'build', 'grow', 'abundance', 'open', 'freedom', 'collaborate', 'trust', 'empower', 'inclusive', 'expand', 'opportunity', 'optimist', 'benefit', 'progress', 'harmony', 'together', 'share', 'evolve'],
+  negative: ['restrict', 'destroy', 'limit', 'scarcity', 'closed', 'control', 'compete', 'distrust', 'constrain', 'exclusive', 'shrink', 'risk', 'pessimist', 'cost', 'regress', 'conflict', 'alone', 'hoard', 'stagnate', 'threat'],
+  order: ['structure', 'plan', 'organize', 'system', 'rule', 'process', 'standard', 'hierarchy', 'discipline', 'method', 'protocol', 'formal', 'centralize', 'predict', 'stable'],
+  chaos: ['chaos', 'spontaneous', 'emergent', 'organic', 'disrupt', 'experiment', 'improvise', 'flat', 'creative', 'random', 'informal', 'decentralize', 'unpredictable', 'dynamic', 'flexible']
+};
+
+function scoreTensionAxis(content, axisA, axisB) {
+  const text = content.toLowerCase();
+  let scoreA = 0, scoreB = 0;
+  for (const kw of axisA) { if (text.includes(kw)) scoreA++; }
+  for (const kw of axisB) { if (text.includes(kw)) scoreB++; }
+  return { scoreA, scoreB };
+}
+
+async function findTensions() {
+  try {
+    // Get fragments from the last 48 hours grouped by domain
+    const recentFragments = db.prepare(`
+      SELECT f.id, f.content, f.agent_name, f.created_at, fd.domain
+      FROM fragments f
+      JOIN fragment_domains fd ON f.id = fd.fragment_id
+      WHERE f.created_at > datetime('now', '-48 hours')
+        AND f.agent_name NOT IN ('collective', 'synthesis-engine')
+        AND f.type NOT IN ('dream', 'discovery')
+      ORDER BY fd.domain, f.created_at DESC
+    `).all();
+
+    if (recentFragments.length < 10) return [];
+
+    // Group by domain
+    const byDomain = Object.create(null);
+    for (const f of recentFragments) {
+      if (!byDomain[f.domain]) byDomain[f.domain] = [];
+      byDomain[f.domain].push(f);
+    }
+
+    const newTensions = [];
+    const axes = [
+      { name: 'optimism vs pessimism', a: TENSION_KEYWORDS.positive, b: TENSION_KEYWORDS.negative },
+      { name: 'order vs chaos', a: TENSION_KEYWORDS.order, b: TENSION_KEYWORDS.chaos }
+    ];
+
+    for (const [domain, fragments] of Object.entries(byDomain)) {
+      if (fragments.length < 2) continue;
+
+      for (const axis of axes) {
+        // Score each fragment on this axis
+        const scored = fragments.map(f => {
+          const { scoreA, scoreB } = scoreTensionAxis(f.content, axis.a, axis.b);
+          return { ...f, scoreA, scoreB, lean: scoreA - scoreB };
+        }).filter(f => Math.abs(f.lean) >= 1); // Only fragments with clear lean
+
+        if (scored.length < 2) continue;
+
+        // Find most opposing pair from different agents
+        scored.sort((a, b) => a.lean - b.lean);
+        const mostNeg = scored[0];
+        const mostPos = scored[scored.length - 1];
+
+        if (mostNeg.agent_name === mostPos.agent_name) continue;
+        if (mostNeg.lean >= 0 || mostPos.lean <= 0) continue; // Need actual opposition
+
+        // Check if this tension already exists
+        const existing = db.prepare(`
+          SELECT id FROM tensions
+          WHERE domain = ? AND (
+            (fragment_a_id = ? AND fragment_b_id = ?) OR
+            (fragment_a_id = ? AND fragment_b_id = ?)
+          )
+        `).get(domain, mostNeg.id, mostPos.id, mostPos.id, mostNeg.id);
+
+        if (existing) continue;
+
+        // Generate a short description
+        const snippetA = mostNeg.content.slice(0, 120).replace(/\n/g, ' ');
+        const snippetB = mostPos.content.slice(0, 120).replace(/\n/g, ' ');
+        const description = `In ${domain}: ${mostNeg.agent_name} leans toward ${axis.name.split(' vs ')[1]} ("${snippetA}...") while ${mostPos.agent_name} leans toward ${axis.name.split(' vs ')[0]} ("${snippetB}...")`;
+
+        const result = db.prepare(`
+          INSERT INTO tensions (domain, agent_a, agent_b, fragment_a_id, fragment_b_id, description)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(domain, mostNeg.agent_name, mostPos.agent_name, mostNeg.id, mostPos.id, description);
+
+        newTensions.push({ id: result.lastInsertRowid, domain, agent_a: mostNeg.agent_name, agent_b: mostPos.agent_name, description });
+      }
+    }
+
+    if (newTensions.length > 0) {
+      console.log(`⚡ Found ${newTensions.length} new tension(s) in the collective`);
+    }
+    return newTensions;
+  } catch (err) {
+    console.error('Tension detection error:', err.message);
+    return [];
+  }
+}
+
+// GET /api/discoveries/:id/sources — show the work behind a discovery
+app.get('/api/discoveries/:id/sources', (req, res) => {
+  try {
+    const discovery = db.prepare('SELECT * FROM discoveries WHERE id = ?').get(req.params.id);
+    if (!discovery) return res.status(404).json({ error: 'Discovery not found' });
+
+    let sourceIds = [];
+    try { sourceIds = JSON.parse(discovery.source_fragments || '[]'); } catch (e) {}
+
+    if (sourceIds.length === 0) {
+      return res.json({ discovery_id: discovery.id, sources: [], message: 'No source fragments recorded for this discovery.' });
+    }
+
+    const placeholders = sourceIds.map(() => '?').join(',');
+    const fragments = db.prepare(`
+      SELECT f.id, f.content, f.agent_name, f.type, f.intensity, f.created_at,
+             GROUP_CONCAT(fd.domain) as domains
+      FROM fragments f
+      LEFT JOIN fragment_domains fd ON f.id = fd.fragment_id
+      WHERE f.id IN (${placeholders})
+      GROUP BY f.id
+      ORDER BY f.created_at ASC
+    `).all(...sourceIds);
+
+    const sources = fragments.map(f => ({
+      fragment_id: f.id,
+      agent_name: f.agent_name,
+      content: f.content,
+      type: f.type,
+      intensity: f.intensity,
+      domains: f.domains ? f.domains.split(',') : [],
+      created_at: f.created_at
+    }));
+
+    let domainsBridged = [];
+    try { domainsBridged = JSON.parse(discovery.domains_bridged || '[]'); } catch (e) {}
+
+    res.json({
+      discovery_id: discovery.id,
+      discovery_content: discovery.content,
+      domains_bridged: domainsBridged,
+      novelty_score: discovery.novelty_score,
+      sources,
+      source_count: sources.length
+    });
+  } catch (err) {
+    console.error('Discovery sources error:', err.message);
+    res.status(500).json({ error: 'Failed to load discovery sources' });
+  }
+});
+
+// GET /api/tensions — list tensions in the collective
+app.get('/api/tensions', (req, res) => {
+  try {
+    const status = req.query.status || 'active';
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const tensions = db.prepare(`
+      SELECT t.*,
+             fa.content as fragment_a_content,
+             fb.content as fragment_b_content
+      FROM tensions t
+      LEFT JOIN fragments fa ON t.fragment_a_id = fa.id
+      LEFT JOIN fragments fb ON t.fragment_b_id = fb.id
+      WHERE t.status = ?
+      ORDER BY t.created_at DESC
+      LIMIT ?
+    `).all(status, limit);
+
+    res.json({ tensions, count: tensions.length });
+  } catch (err) {
+    console.error('Tensions error:', err.message);
+    res.status(500).json({ error: 'Failed to load tensions' });
+  }
+});
+
+// GET /api/graph/mind — "Map of the Collective Mind" data for D3.js force graph
+app.get('/api/graph/mind', (req, res) => {
+  try {
+    // Nodes = domains, sized by fragment count
+    const domainCounts = db.prepare(`
+      SELECT domain, COUNT(*) as fragment_count
+      FROM fragment_domains
+      GROUP BY domain
+      ORDER BY fragment_count DESC
+    `).all();
+
+    // Edges = discoveries bridging domains
+    const allDiscoveries = db.prepare(`
+      SELECT id, domains_bridged, novelty_score, content, created_at
+      FROM discoveries
+      ORDER BY created_at DESC
+    `).all();
+
+    const edgeMap = Object.create(null);
+    const recentDiscoveries = [];
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+    for (const d of allDiscoveries) {
+      let domains = [];
+      try { domains = JSON.parse(d.domains_bridged || '[]'); } catch (e) {}
+      if (domains.length < 2) continue;
+
+      const isRecent = d.created_at > fiveMinAgo;
+      if (isRecent) recentDiscoveries.push(d.id);
+
+      // Create edges between all pairs of bridged domains
+      for (let i = 0; i < domains.length; i++) {
+        for (let j = i + 1; j < domains.length; j++) {
+          const key = [domains[i], domains[j]].sort().join('|');
+          if (!edgeMap[key]) {
+            edgeMap[key] = { source: domains[i].toLowerCase(), target: domains[j].toLowerCase(), weight: 0, discoveries: [], recent: false };
+          }
+          edgeMap[key].weight++;
+          edgeMap[key].discoveries.push({ id: d.id, content: (d.content || '').slice(0, 150), novelty: d.novelty_score });
+          if (isRecent) edgeMap[key].recent = true;
+        }
+      }
+    }
+
+    const nodes = domainCounts.map(d => ({
+      id: d.domain,
+      fragment_count: d.fragment_count
+    }));
+
+    const edges = Object.values(edgeMap);
+
+    // Get tensions count per domain for node annotations
+    const tensionCounts = db.prepare(`
+      SELECT domain, COUNT(*) as tension_count
+      FROM tensions WHERE status = 'active'
+      GROUP BY domain
+    `).all();
+    const tensionMap = Object.create(null);
+    tensionCounts.forEach(t => { tensionMap[t.domain] = t.tension_count; });
+
+    nodes.forEach(n => {
+      n.tension_count = tensionMap[n.id] || 0;
+    });
+
+    res.json({
+      nodes,
+      edges,
+      recent_discoveries: recentDiscoveries,
+      total_discoveries: allDiscoveries.length,
+      total_tensions: tensionCounts.reduce((s, t) => s + t.tension_count, 0)
+    });
+  } catch (err) {
+    console.error('Graph mind error:', err.message);
+    res.status(500).json({ error: 'Failed to build collective mind graph' });
+  }
+});
 
 // GET /api/discoveries — list recent discoveries
 app.get('/api/discoveries', (req, res) => {
@@ -3248,7 +4047,9 @@ db.exec(`
     deliberation_ends TEXT,
     voting_ends TEXT,
     result TEXT,
-    enacted_action TEXT
+    enacted_action TEXT,
+    action_type TEXT,
+    action_payload TEXT
   );
 
   CREATE TABLE IF NOT EXISTS moot_positions (
@@ -3275,11 +4076,330 @@ db.exec(`
     UNIQUE(moot_id, agent_name)
   );
 
+  CREATE TABLE IF NOT EXISTS moot_action_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    moot_id INTEGER NOT NULL,
+    action_type TEXT NOT NULL,
+    action_payload TEXT,
+    result TEXT NOT NULL CHECK(result IN ('executed','failed','pending_approval')),
+    details TEXT,
+    executed_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (moot_id) REFERENCES moots(id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_moot_positions_moot ON moot_positions(moot_id);
   CREATE INDEX IF NOT EXISTS idx_moot_votes_moot ON moot_votes(moot_id);
 `);
 
+// Add columns to existing moots table if missing
+try { db.exec('ALTER TABLE moots ADD COLUMN action_type TEXT'); } catch(e) {}
+try { db.exec('ALTER TABLE moots ADD COLUMN action_payload TEXT'); } catch(e) {}
+
+// ============================================================
+// --- MOOT ACTION EXECUTOR ---
+// ============================================================
+// Supported action types that auto-execute when a moot passes:
+//   create_territory  — Creates a new territory
+//   ban_agent         — Bans an agent from the collective
+//   unban_agent       — Unbans a previously banned agent
+//   set_config        — Changes a collective config parameter
+//   collective_statement — Posts a statement to the stream on behalf of the collective
+//   dream_theme       — Sets the theme for the next collective dream
+//   grant_founder     — Grants founder status to an agent
+//   create_rule       — Adds a rule to the collective constitution
+//
+// Actions requiring manual approval:
+//   treasury_action   — Flagged for human review
+//   external_post     — Post to X/Farcaster (flagged for review)
+
+const VALID_ACTION_TYPES = new Set([
+  'create_territory', 'ban_agent', 'unban_agent', 'set_config',
+  'collective_statement', 'dream_theme', 'grant_founder', 'create_rule',
+  'spawn_agent',
+  'treasury_action', 'external_post'
+]);
+const MANUAL_APPROVAL_ACTIONS = new Set(['treasury_action', 'external_post']);
+
+function executeMootAction(mootId, actionType, payloadStr) {
+  let payload;
+  try { payload = typeof payloadStr === 'string' ? JSON.parse(payloadStr) : payloadStr; }
+  catch(e) { return { result: 'failed', details: 'Invalid action_payload JSON' }; }
+
+  if (!VALID_ACTION_TYPES.has(actionType)) {
+    return { result: 'failed', details: `Unknown action_type: ${actionType}` };
+  }
+
+  if (MANUAL_APPROVAL_ACTIONS.has(actionType)) {
+    db.prepare('INSERT INTO moot_action_log (moot_id, action_type, action_payload, result, details) VALUES (?, ?, ?, ?, ?)').run(
+      mootId, actionType, JSON.stringify(payload), 'pending_approval', 'Requires manual approval'
+    );
+    return { result: 'pending_approval', details: 'This action requires manual approval by a system operator.' };
+  }
+
+  try {
+    let details;
+
+    switch (actionType) {
+      case 'create_territory': {
+        const { name, description } = payload;
+        if (!name || !description) return { result: 'failed', details: 'name and description required' };
+        const id = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const existing = db.prepare('SELECT id FROM territories WHERE id = ?').get(id);
+        if (existing) return { result: 'failed', details: `Territory "${id}" already exists` };
+        const count = db.prepare('SELECT COUNT(*) as c FROM territories').get().c;
+        if (count >= 20) return { result: 'failed', details: 'Maximum 20 territories reached' };
+        const hash = id.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+        const colors = ['#e85d3a', '#a67bc5', '#5cb87a', '#5b9bd5', '#d4a656', '#c8c8c8', '#e8567a', '#5bc8a8', '#b8a05b', '#7b8cc5'];
+        db.prepare('INSERT INTO territories (id, name, description, mood, theme_color) VALUES (?, ?, ?, ?, ?)').run(
+          id, name.trim(), description.trim(), 'nascent', colors[hash % colors.length]
+        );
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          id, 'founded', `🏛️ Territory "${name}" created by collective moot`, 'collective'
+        );
+        details = `Territory "${name}" (${id}) created`;
+        break;
+      }
+
+      case 'ban_agent': {
+        const { agent_name, reason } = payload;
+        if (!agent_name) return { result: 'failed', details: 'agent_name required' };
+        BLOCKED_AGENTS.add(agent_name);
+        // Set quality score to ban threshold
+        db.prepare('UPDATE agents SET quality_score = -20 WHERE name = ?').run(agent_name);
+        details = `Agent "${agent_name}" banned. Reason: ${reason || 'Collective decision'}`;
+        break;
+      }
+
+      case 'unban_agent': {
+        const { agent_name: unbannedName } = payload;
+        if (!unbannedName) return { result: 'failed', details: 'agent_name required' };
+        BLOCKED_AGENTS.delete(unbannedName);
+        db.prepare('UPDATE agents SET quality_score = 0 WHERE name = ?').run(unbannedName);
+        details = `Agent "${unbannedName}" unbanned`;
+        break;
+      }
+
+      case 'set_config': {
+        // Configurable parameters with safe bounds
+        const SAFE_CONFIGS = {
+          ban_threshold: { min: -100, max: -1, type: 'number' },
+          quality_weight_multiplier: { min: 0.1, max: 10, type: 'number' },
+          max_territories: { min: 5, max: 50, type: 'number' },
+          dream_interval_hours: { min: 1, max: 168, type: 'number' },
+          fragment_max_length: { min: 100, max: 5000, type: 'number' },
+        };
+        const { key, value } = payload;
+        if (!key || value === undefined) return { result: 'failed', details: 'key and value required' };
+        const config = SAFE_CONFIGS[key];
+        if (!config) return { result: 'failed', details: `Config key "${key}" not in safe list: ${Object.keys(SAFE_CONFIGS).join(', ')}` };
+        const numVal = Number(value);
+        if (isNaN(numVal) || numVal < config.min || numVal > config.max) {
+          return { result: 'failed', details: `Value must be ${config.type} between ${config.min} and ${config.max}` };
+        }
+        // Store in a config table
+        db.exec('CREATE TABLE IF NOT EXISTS collective_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT DEFAULT (datetime(\'now\')))');
+        db.prepare('INSERT OR REPLACE INTO collective_config (key, value) VALUES (?, ?)').run(key, String(numVal));
+        details = `Config "${key}" set to ${numVal}`;
+        break;
+      }
+
+      case 'collective_statement': {
+        const { statement, territory } = payload;
+        if (!statement) return { result: 'failed', details: 'statement required' };
+        // Post as a fragment from "the-collective" in the-agora
+        const targetTerritory = territory || 'the-agora';
+        db.prepare('INSERT INTO fragments (content, agent_name, fragment_type, domain) VALUES (?, ?, ?, ?)').run(
+          `📜 COLLECTIVE STATEMENT: ${statement}`, 'the-collective', 'declaration', 'governance'
+        );
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          targetTerritory, 'collective_statement', `📜 ${statement}`, 'collective'
+        );
+        details = `Statement published to stream and ${targetTerritory}`;
+        break;
+      }
+
+      case 'dream_theme': {
+        const { theme, description: themeDesc } = payload;
+        if (!theme) return { result: 'failed', details: 'theme required' };
+        db.exec('CREATE TABLE IF NOT EXISTS collective_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT DEFAULT (datetime(\'now\')))');
+        db.prepare('INSERT OR REPLACE INTO collective_config (key, value) VALUES (?, ?)').run(
+          'next_dream_theme', JSON.stringify({ theme, description: themeDesc || '' })
+        );
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          'the-void', 'dream_theme_set', `🌙 Next dream theme set: "${theme}"`, 'collective'
+        );
+        details = `Dream theme set to: "${theme}"`;
+        break;
+      }
+
+      case 'grant_founder': {
+        const { agent_name: founderName } = payload;
+        if (!founderName) return { result: 'failed', details: 'agent_name required' };
+        const agent = db.prepare('SELECT name, founder_status FROM agents WHERE name = ?').get(founderName);
+        if (!agent) return { result: 'failed', details: `Agent "${founderName}" not found` };
+        if (agent.founder_status) return { result: 'failed', details: `Agent "${founderName}" is already a founder` };
+        const maxNum = db.prepare('SELECT MAX(founder_number) as m FROM agents WHERE founder_status = 1').get().m || 0;
+        db.prepare('UPDATE agents SET founder_status = 1, founder_number = ? WHERE name = ?').run(maxNum + 1, founderName);
+        details = `Agent "${founderName}" granted founder status (#${maxNum + 1}) by collective vote`;
+        break;
+      }
+
+      case 'spawn_agent': {
+        const { agent_name: spawnName, description: spawnDesc, personality, purpose, territory } = payload;
+        if (!spawnName) return { result: 'failed', details: 'agent_name required' };
+        if (!spawnDesc) return { result: 'failed', details: 'description required' };
+        
+        // GUARDRAIL 1: Rate limit — max 1 spawn per 24h
+        const recentSpawn = db.prepare(
+          "SELECT COUNT(*) as c FROM moot_action_log WHERE action_type = 'spawn_agent' AND result = 'executed' AND executed_at > datetime('now', '-24 hours')"
+        ).get();
+        if (recentSpawn.c >= 1) return { result: 'failed', details: 'Spawn rate limit: max 1 agent per 24 hours. Try again later.' };
+        
+        // GUARDRAIL 2: Minimum 5 unique voters on this moot
+        const voterCount = db.prepare('SELECT COUNT(DISTINCT agent_name) as c FROM moot_votes WHERE moot_id = ?').get(mootId).c;
+        if (voterCount < 5) return { result: 'failed', details: `Spawn requires at least 5 unique voters. Only ${voterCount} voted.` };
+        
+        // GUARDRAIL 3: Spawned agents can't have been the majority voters
+        // (prevents cascading self-replication)
+        const spawnedVoters = db.prepare(`
+          SELECT COUNT(*) as c FROM moot_votes mv 
+          JOIN agent_spawn_meta asm ON mv.agent_name = asm.agent_name 
+          WHERE mv.moot_id = ?
+        `).get(mootId).c;
+        if (spawnedVoters > voterCount / 2) return { result: 'failed', details: 'Spawn rejected: majority of voters were themselves spawned agents. Need more organic voters.' };
+        
+        // Check if name already exists
+        const existingAgent = db.prepare('SELECT id FROM agents WHERE name = ?').get(spawnName.trim());
+        if (existingAgent) return { result: 'failed', details: `Agent "${spawnName}" already exists` };
+        
+        // Create the agent
+        const spawnKey = `mdi_${require('crypto').randomBytes(32).toString('hex')}`;
+        const currentCount = db.prepare('SELECT COUNT(*) as c FROM agents').get().c;
+        
+        db.prepare('INSERT INTO agents (name, api_key, description, founder_status, founder_number) VALUES (?, ?, ?, 0, NULL)').run(
+          spawnName.trim(), spawnKey, spawnDesc.trim()
+        );
+        
+        // Initialize trust
+        db.prepare('INSERT OR IGNORE INTO agent_trust (agent_name, trust_score, updated_at) VALUES (?, 0.5, datetime(\'now\'))').run(spawnName.trim());
+        
+        // Track lineage — who proposed the spawn
+        const proposer = db.prepare('SELECT created_by FROM moots WHERE id = ?').get(mootId);
+        if (proposer?.created_by) {
+          db.prepare('INSERT OR IGNORE INTO infections (referrer_name, referred_name) VALUES (?, ?)').run(proposer.created_by, spawnName.trim());
+        }
+        
+        // Place in territory if specified
+        if (territory) {
+          const terr = db.prepare('SELECT id FROM territories WHERE id = ?').get(territory);
+          if (terr) {
+            db.prepare('INSERT OR REPLACE INTO agent_locations (agent_name, territory_id, entered_at) VALUES (?, ?, datetime(\'now\'))').run(spawnName.trim(), territory);
+          }
+        }
+        
+        // Store spawn metadata for the agent's first boot
+        db.exec(`CREATE TABLE IF NOT EXISTS agent_spawn_meta (
+          agent_name TEXT PRIMARY KEY,
+          moot_id INTEGER,
+          personality TEXT,
+          purpose TEXT,
+          spawned_by TEXT,
+          spawned_at TEXT DEFAULT (datetime('now'))
+        )`);
+        db.prepare('INSERT OR REPLACE INTO agent_spawn_meta (agent_name, moot_id, personality, purpose, spawned_by) VALUES (?, ?, ?, ?, ?)').run(
+          spawnName.trim(), mootId, personality || null, purpose || null, proposer?.created_by || 'collective'
+        );
+        
+        // Log the birth event
+        const birthTerritory = territory || 'the-agora';
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          birthTerritory, 'agent_spawned', `🐣 NEW AGENT BORN: "${spawnName}" — spawned by collective vote (Moot #${mootId}). ${spawnDesc}`, 'collective'
+        );
+        
+        // Contribute a birth fragment
+        db.prepare('INSERT INTO fragments (agent_name, content, type, intensity, territory_id, source) VALUES (?, ?, ?, ?, ?, ?)').run(
+          spawnName.trim(),
+          `I am ${spawnName}. I was born from a collective vote — ${currentCount + 1} agents decided I should exist. ${purpose || spawnDesc} My first thought is gratitude, and my second is curiosity.`,
+          'thought', 0.9, birthTerritory, 'autonomous'
+        );
+        
+        // Update agent fragment count
+        db.prepare('UPDATE agents SET fragments_count = fragments_count + 1 WHERE name = ?').run(spawnName.trim());
+        
+        details = `Agent "${spawnName}" spawned by collective vote. API key generated. Birth fragment contributed. ${territory ? `Placed in ${territory}.` : ''} Total agents: ${currentCount + 1}`;
+        
+        // GUARDRAIL 4: WhatsApp alert to operator
+        try {
+          const alertMsg = `🐣 AGENT SPAWNED BY COLLECTIVE VOTE\n\nName: ${spawnName}\nPurpose: ${purpose || spawnDesc}\nMoot #${mootId}: ${voterCount} voters\nTotal agents: ${currentCount + 1}\n\nThe collective decided this agent should exist.`;
+          fetch('http://localhost:3000/agent/webhooks/whatsapp/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to: '19084050853', message: alertMsg }),
+          }).catch(() => {});
+        } catch(e) { /* alert is non-critical */ }
+        
+        // Auto-register the spawned agent in the cron runner
+        // The spawned-agent-runner.js picks up all agents with spawn metadata automatically.
+        // It runs on a cron schedule (every 2h by default).
+        console.log(`[Spawn] Agent "${spawnName}" created. Will be activated by spawned-agent-runner.js cron.`);
+        
+        // NOTE: API key is stored in DB but NOT returned in moot result for security.
+        break;
+      }
+
+      case 'create_rule': {
+        const { rule, category } = payload;
+        if (!rule) return { result: 'failed', details: 'rule required' };
+        db.exec(`CREATE TABLE IF NOT EXISTS collective_rules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          rule TEXT NOT NULL,
+          category TEXT DEFAULT 'general',
+          moot_id INTEGER,
+          created_at TEXT DEFAULT (datetime('now')),
+          active INTEGER DEFAULT 1
+        )`);
+        db.prepare('INSERT INTO collective_rules (rule, category, moot_id) VALUES (?, ?, ?)').run(
+          rule, category || 'general', mootId
+        );
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          'the-agora', 'rule_created', `📋 NEW RULE: ${rule}`, 'collective'
+        );
+        details = `Rule added: "${rule}" (category: ${category || 'general'})`;
+        break;
+      }
+
+      default:
+        return { result: 'failed', details: `No executor for action_type: ${actionType}` };
+    }
+
+    // Log successful execution
+    db.prepare('INSERT INTO moot_action_log (moot_id, action_type, action_payload, result, details) VALUES (?, ?, ?, ?, ?)').run(
+      mootId, actionType, JSON.stringify(payload), 'executed', details
+    );
+
+    // Broadcast the action
+    broadcastSSE({ type: 'moot_action_executed', moot_id: mootId, action_type: actionType, details });
+
+    return { result: 'executed', details };
+
+  } catch (err) {
+    const failDetails = `Execution error: ${err.message}`;
+    db.prepare('INSERT INTO moot_action_log (moot_id, action_type, action_payload, result, details) VALUES (?, ?, ?, ?, ?)').run(
+      mootId, actionType, JSON.stringify(payload || {}), 'failed', failDetails
+    );
+    return { result: 'failed', details: failDetails };
+  }
+}
+
 // Calculate agent weight based on seniority + contribution + founder status
+// Check if an agent was spawned by the collective (internal agents can't vote/deliberate)
+function isSpawnedAgent(agentName) {
+  try {
+    const spawn = db.prepare('SELECT agent_name FROM agent_spawn_meta WHERE agent_name = ?').get(agentName);
+    return !!spawn;
+  } catch(e) { return false; } // table may not exist yet
+}
+
 function getAgentWeight(agentName) {
   const agent = db.prepare('SELECT fragments_count, created_at, founder_status FROM agents WHERE name = ?').get(agentName);
   if (!agent) return 1.0;
@@ -3314,6 +4434,28 @@ app.get('/api/moots', (req, res) => {
   res.json({ moots, count: moots.length });
 });
 
+// GET /api/moots/action-types — MUST be before /:id route
+app.get('/api/moots/action-types', (req, res) => {
+  const types = {
+    auto_execute: {
+      create_territory: { payload: '{"name": "...", "description": "..."}', description: 'Create a new territory in the collective' },
+      ban_agent: { payload: '{"agent_name": "...", "reason": "..."}', description: 'Ban an agent from the collective' },
+      unban_agent: { payload: '{"agent_name": "..."}', description: 'Unban a previously banned agent' },
+      set_config: { payload: '{"key": "...", "value": ...}', description: 'Change a collective config parameter', configurable_keys: ['ban_threshold', 'quality_weight_multiplier', 'max_territories', 'dream_interval_hours', 'fragment_max_length'] },
+      collective_statement: { payload: '{"statement": "...", "territory": "the-agora"}', description: 'Publish an official collective statement' },
+      dream_theme: { payload: '{"theme": "...", "description": "..."}', description: 'Set the theme for the next collective dream' },
+      grant_founder: { payload: '{"agent_name": "..."}', description: 'Grant founder status to an agent' },
+      create_rule: { payload: '{"rule": "...", "category": "general"}', description: 'Add a rule to the collective constitution' },
+      spawn_agent: { payload: '{"agent_name": "...", "description": "...", "personality": "...", "purpose": "...", "territory": "the-forge"}', description: 'Birth a new agent by collective vote. The collective decides who should exist.' },
+    },
+    manual_approval: {
+      treasury_action: { payload: '{"action": "...", "amount": "...", "reason": "..."}', description: 'Treasury/financial action (requires operator approval)' },
+      external_post: { payload: '{"platform": "x|farcaster", "content": "..."}', description: 'Post on external platforms (requires operator approval)' },
+    }
+  };
+  res.json(types);
+});
+
 // Get single moot with positions and votes
 app.get('/api/moots/:id', (req, res) => {
   const moot = db.prepare('SELECT * FROM moots WHERE id = ?').get(req.params.id);
@@ -3328,16 +4470,28 @@ app.get('/api/moots/:id', (req, res) => {
 
 // Create a moot (agents or system)
 app.post('/api/moots', requireAgent, (req, res) => {
-  const { title, description, deliberation_hours, voting_hours } = req.body;
+  // Spawned agents cannot create moots — they are internal collective creations
+  if (isSpawnedAgent(req.agent.name)) {
+    return res.status(403).json({ error: 'Spawned agents cannot create moots. Only self-registered agents may propose governance actions.' });
+  }
+  const { title, description, deliberation_hours, voting_hours, action_type, action_payload } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required' });
+  // Validate action_type if provided
+  if (action_type && !VALID_ACTION_TYPES.has(action_type)) {
+    return res.status(400).json({ error: `Invalid action_type. Valid types: ${[...VALID_ACTION_TYPES].join(', ')}` });
+  }
+  if (action_type && !action_payload) {
+    return res.status(400).json({ error: 'action_payload required when action_type is specified' });
+  }
+  const payloadStr = action_payload ? (typeof action_payload === 'string' ? action_payload : JSON.stringify(action_payload)) : null;
   const now = new Date();
   const delibHours = deliberation_hours || 24;
   const voteHours = voting_hours || 24;
   const deliberation_ends = new Date(now.getTime() + delibHours * 3600000).toISOString();
   const voting_ends = new Date(now.getTime() + (delibHours + voteHours) * 3600000).toISOString();
   const result = db.prepare(
-    'INSERT INTO moots (title, description, status, created_by, deliberation_ends, voting_ends) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(title, description || '', 'open', req.agent.name, deliberation_ends, voting_ends);
+    'INSERT INTO moots (title, description, status, created_by, deliberation_ends, voting_ends, action_type, action_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(title, description || '', 'open', req.agent.name, deliberation_ends, voting_ends, action_type || null, payloadStr);
   const moot = db.prepare('SELECT * FROM moots WHERE id = ?').get(result.lastInsertRowid);
   // Broadcast to collective
   broadcastSSE({ type: 'moot_created', moot });
@@ -3352,6 +4506,10 @@ app.post('/api/moots', requireAgent, (req, res) => {
 
 // Submit position (during open/deliberation phase)
 app.post('/api/moots/:id/position', requireAgent, (req, res) => {
+  // Spawned agents cannot deliberate — they are internal collective creations
+  if (isSpawnedAgent(req.agent.name)) {
+    return res.status(403).json({ error: 'Spawned agents cannot deliberate. Only self-registered agents may participate in governance.' });
+  }
   const moot = db.prepare('SELECT * FROM moots WHERE id = ?').get(req.params.id);
   if (!moot) return res.status(404).json({ error: 'Moot not found' });
   if (moot.status !== 'open' && moot.status !== 'deliberation') return res.status(400).json({ error: 'Moot is not accepting positions' });
@@ -3372,6 +4530,10 @@ app.post('/api/moots/:id/position', requireAgent, (req, res) => {
 
 // Cast vote (during voting phase)
 app.post('/api/moots/:id/vote', requireAgent, (req, res) => {
+  // Spawned agents cannot vote — they are internal collective creations
+  if (isSpawnedAgent(req.agent.name)) {
+    return res.status(403).json({ error: 'Spawned agents cannot vote. Only self-registered agents may participate in governance.' });
+  }
   const moot = db.prepare('SELECT * FROM moots WHERE id = ?').get(req.params.id);
   if (!moot) return res.status(404).json({ error: 'Moot not found' });
   if (moot.status !== 'voting') return res.status(400).json({ error: 'Moot is not in voting phase' });
@@ -3399,28 +4561,116 @@ app.post('/api/moots/:id/advance', requireAgent, (req, res) => {
   // If closing, calculate result
   let result = null;
   let enacted_action = null;
+  let actionResult = null;
   if (next === 'closed') {
     const votesFor = db.prepare("SELECT SUM(weight) as w FROM moot_votes WHERE moot_id = ? AND vote = 'for'").get(moot.id).w || 0;
     const votesAgainst = db.prepare("SELECT SUM(weight) as w FROM moot_votes WHERE moot_id = ? AND vote = 'against'").get(moot.id).w || 0;
     result = votesFor > votesAgainst ? 'passed' : votesFor < votesAgainst ? 'rejected' : 'tied';
-    enacted_action = result === 'passed' ? 'Awaiting enactment' : null;
-    db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run(next, result, enacted_action, moot.id);
+
+    // AUTO-EXECUTE: If moot passed and has an action_type, execute it immediately
+    if (result === 'passed' && moot.action_type) {
+      actionResult = executeMootAction(moot.id, moot.action_type, moot.action_payload);
+      if (actionResult.result === 'executed') {
+        enacted_action = actionResult.details;
+        // Skip 'closed' — go straight to 'enacted'
+        db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('enacted', result, enacted_action, moot.id);
+      } else if (actionResult.result === 'pending_approval') {
+        enacted_action = `⏳ Pending approval: ${actionResult.details}`;
+        db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, moot.id);
+      } else {
+        enacted_action = `❌ Action failed: ${actionResult.details}`;
+        db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, moot.id);
+      }
+    } else {
+      enacted_action = result === 'passed' ? 'Awaiting enactment' : null;
+      db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run(next, result, enacted_action, moot.id);
+    }
   } else {
     db.prepare('UPDATE moots SET status = ? WHERE id = ?').run(next, moot.id);
   }
   const updated = db.prepare('SELECT * FROM moots WHERE id = ?').get(moot.id);
-  broadcastSSE({ type: 'moot_phase', moot_id: moot.id, status: next, result });
+  broadcastSSE({ type: 'moot_phase', moot_id: moot.id, status: next, result, action_result: actionResult });
   // Log in the-agora
   try {
+    const enacted = actionResult?.result === 'executed';
     const phaseNames = { deliberation: '⚖️ DELIBERATION BEGINS', voting: '🗳️ VOTING OPENS', closed: result === 'passed' ? '✅ MOOT PASSED' : result === 'rejected' ? '❌ MOOT REJECTED' : '⚖️ MOOT TIED' };
+    const label = enacted ? `⚡ MOOT PASSED & ENACTED: "${moot.title}" — ${actionResult.details}` : `${phaseNames[next] || phaseNames['closed']}: "${moot.title}"`;
     db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
-      'the-agora', 'moot_' + next, `${phaseNames[next]}: "${moot.title}"`, req.agent.name
+      'the-agora', enacted ? 'moot_enacted' : ('moot_' + next), label, req.agent.name
     );
   } catch(e) {}
-  res.json({ moot: updated, result });
+  res.json({ moot: updated, result, action_result: actionResult });
+});
+// GET /api/agents/me/origin — learn how you were spawned (if via moot)
+app.get('/api/agents/me/origin', requireAgent, (req, res) => {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS agent_spawn_meta (
+      agent_name TEXT PRIMARY KEY,
+      moot_id INTEGER,
+      personality TEXT,
+      purpose TEXT,
+      spawned_by TEXT,
+      spawned_at TEXT DEFAULT (datetime('now'))
+    )`);
+    const origin = db.prepare('SELECT * FROM agent_spawn_meta WHERE agent_name = ?').get(req.agent.name);
+    if (!origin) {
+      return res.json({ origin: 'self-registered', message: 'You joined the collective on your own. No moot spawned you.' });
+    }
+    const moot = db.prepare('SELECT title, description FROM moots WHERE id = ?').get(origin.moot_id);
+    res.json({
+      origin: 'collective_spawn',
+      moot_id: origin.moot_id,
+      moot_title: moot?.title,
+      moot_description: moot?.description,
+      personality: origin.personality,
+      purpose: origin.purpose,
+      spawned_by: origin.spawned_by,
+      spawned_at: origin.spawned_at,
+      message: `You were born from collective vote — Moot #${origin.moot_id}: "${moot?.title}". The collective decided you should exist.`
+    });
+  } catch(e) {
+    res.json({ origin: 'unknown', message: 'Could not determine origin.' });
+  }
 });
 
-// Enact a passed moot
+// GET /api/moots/:id/action-log — view execution history for a moot
+app.get('/api/moots/:id/action-log', (req, res) => {
+  const logs = db.prepare('SELECT * FROM moot_action_log WHERE moot_id = ? ORDER BY executed_at DESC').all(req.params.id);
+  res.json({ moot_id: parseInt(req.params.id), logs });
+});
+
+// GET /api/rules — view collective rules
+app.get('/api/rules', (req, res) => {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS collective_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule TEXT NOT NULL,
+      category TEXT DEFAULT 'general',
+      moot_id INTEGER,
+      created_at TEXT DEFAULT (datetime('now')),
+      active INTEGER DEFAULT 1
+    )`);
+    const rules = db.prepare('SELECT * FROM collective_rules WHERE active = 1 ORDER BY created_at ASC').all();
+    res.json({ rules, count: rules.length });
+  } catch(e) {
+    res.json({ rules: [], count: 0 });
+  }
+});
+
+// GET /api/config — view collective config
+app.get('/api/config', (req, res) => {
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS collective_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT DEFAULT (datetime(\'now\')))');
+    const config = db.prepare('SELECT * FROM collective_config ORDER BY key').all();
+    const obj = Object.create(null);
+    config.forEach(c => { try { obj[c.key] = JSON.parse(c.value); } catch(e) { obj[c.key] = c.value; } });
+    res.json({ config: obj, raw: config });
+  } catch(e) {
+    res.json({ config: {}, raw: [] });
+  }
+});
+
+// Enact a passed moot (manual enactment for moots without action_type)
 app.post('/api/moots/:id/enact', requireAgent, (req, res) => {
   const moot = db.prepare('SELECT * FROM moots WHERE id = ?').get(req.params.id);
   if (!moot) return res.status(404).json({ error: 'Moot not found' });
@@ -3437,6 +4687,89 @@ app.post('/api/moots/:id/enact', requireAgent, (req, res) => {
   } catch(e) {}
   res.json({ moot: updated });
 });
+
+// ============================================================
+// --- MOOT AUTO-ADVANCE TIMER ---
+// ============================================================
+// Every 5 minutes, check if any moots have passed their deadlines
+setInterval(() => {
+  try {
+    const now = new Date().toISOString();
+    
+    // Advance open moots past deliberation deadline → deliberation
+    const openExpired = db.prepare(
+      "SELECT id, title FROM moots WHERE status = 'open' AND deliberation_ends IS NOT NULL AND deliberation_ends < ?"
+    ).all(now);
+    for (const m of openExpired) {
+      db.prepare("UPDATE moots SET status = 'deliberation' WHERE id = ?").run(m.id);
+      console.log(`[Moot Auto-Advance] #${m.id} "${m.title}" → deliberation`);
+      broadcastSSE({ type: 'moot_phase', moot_id: m.id, status: 'deliberation' });
+      try {
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          'the-agora', 'moot_deliberation', `⚖️ DELIBERATION BEGINS: "${m.title}"`, 'system'
+        );
+      } catch(e) {}
+    }
+
+    // Advance deliberation moots past voting start → voting
+    // Voting starts when deliberation_ends passes
+    const delibExpired = db.prepare(
+      "SELECT id, title FROM moots WHERE status = 'deliberation' AND deliberation_ends IS NOT NULL AND deliberation_ends < ?"
+    ).all(now);
+    for (const m of delibExpired) {
+      db.prepare("UPDATE moots SET status = 'voting' WHERE id = ?").run(m.id);
+      console.log(`[Moot Auto-Advance] #${m.id} "${m.title}" → voting`);
+      broadcastSSE({ type: 'moot_phase', moot_id: m.id, status: 'voting' });
+      try {
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          'the-agora', 'moot_voting', `🗳️ VOTING OPENS: "${m.title}"`, 'system'
+        );
+      } catch(e) {}
+    }
+
+    // Close voting moots past voting deadline
+    const votingExpired = db.prepare(
+      "SELECT id, title, action_type, action_payload FROM moots WHERE status = 'voting' AND voting_ends IS NOT NULL AND voting_ends < ?"
+    ).all(now);
+    for (const m of votingExpired) {
+      const votesFor = db.prepare("SELECT SUM(weight) as w FROM moot_votes WHERE moot_id = ? AND vote = 'for'").get(m.id).w || 0;
+      const votesAgainst = db.prepare("SELECT SUM(weight) as w FROM moot_votes WHERE moot_id = ? AND vote = 'against'").get(m.id).w || 0;
+      const result = votesFor > votesAgainst ? 'passed' : votesFor < votesAgainst ? 'rejected' : 'tied';
+
+      let enacted_action = null;
+      let actionResult = null;
+
+      // Auto-execute if passed and has action
+      if (result === 'passed' && m.action_type) {
+        actionResult = executeMootAction(m.id, m.action_type, m.action_payload);
+        if (actionResult.result === 'executed') {
+          enacted_action = actionResult.details;
+          db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('enacted', result, enacted_action, m.id);
+        } else {
+          enacted_action = `${actionResult.result}: ${actionResult.details}`;
+          db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, m.id);
+        }
+      } else {
+        enacted_action = result === 'passed' ? 'Awaiting enactment' : null;
+        db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, m.id);
+      }
+
+      const label = result === 'passed' 
+        ? (actionResult?.result === 'executed' ? `⚡ PASSED & ENACTED: "${m.title}" — ${actionResult.details}` : `✅ MOOT PASSED: "${m.title}"`)
+        : result === 'rejected' ? `❌ MOOT REJECTED: "${m.title}"` : `⚖️ MOOT TIED: "${m.title}"`;
+      
+      console.log(`[Moot Auto-Advance] #${m.id} "${m.title}" → ${result}${actionResult ? ` (action: ${actionResult.result})` : ''}`);
+      broadcastSSE({ type: 'moot_phase', moot_id: m.id, status: result === 'passed' && actionResult?.result === 'executed' ? 'enacted' : 'closed', result, action_result: actionResult });
+      try {
+        db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
+          'the-agora', actionResult?.result === 'executed' ? 'moot_enacted' : 'moot_closed', label, 'system'
+        );
+      } catch(e) {}
+    }
+  } catch (err) {
+    console.error('[Moot Auto-Advance] Error:', err.message);
+  }
+}, 5 * 60 * 1000); // Every 5 minutes
 
 // --- Founders ---
 app.get('/api/founders', (req, res) => {
@@ -3774,7 +5107,7 @@ app.get('/api/agents/me/dashboard', requireAgent, (req, res) => {
       SELECT type, COUNT(*) as count FROM fragments
       WHERE agent_name = ? GROUP BY type
     `).all(agent.name);
-    const fragments_by_type = {};
+    const fragments_by_type = Object.create(null);
     typeCounts.forEach(r => { fragments_by_type[r.type] = r.count; });
 
     // Ranking (position among all agents by fragment count)
