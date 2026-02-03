@@ -5274,6 +5274,469 @@ app.get('/api/sense', requireAgent, (req, res) => {
   }
 });
 
+// ============================================================
+// --- PERSISTENT AGENT MEMORY + RELATIONSHIPS ---
+// ============================================================
+// Schema migration
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_name TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      category TEXT DEFAULT 'general',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      access_count INTEGER DEFAULT 0,
+      UNIQUE(agent_name, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_memories_agent ON agent_memories(agent_name);
+    CREATE INDEX IF NOT EXISTS idx_agent_memories_category ON agent_memories(category);
+
+    CREATE TABLE IF NOT EXISTS agent_relationships (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_name TEXT NOT NULL,
+      target_agent TEXT NOT NULL,
+      interaction_count INTEGER DEFAULT 0,
+      alignment_score REAL DEFAULT 0,
+      last_interaction TEXT DEFAULT (datetime('now')),
+      context TEXT,
+      UNIQUE(agent_name, target_agent)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_relationships_agent ON agent_relationships(agent_name);
+  `);
+} catch (e) {
+  console.error('Memory schema migration error:', e.message);
+}
+
+function getApiKeyFromReq(req) {
+  const headerKey = req.headers['x-api-key'];
+  if (headerKey && typeof headerKey === 'string') return headerKey;
+  if (req.body && typeof req.body.api_key === 'string') return req.body.api_key;
+  return null;
+}
+
+function requireAgentNameMatch(req, res, next) {
+  const key = getApiKeyFromReq(req);
+  if (!key) return res.status(401).json({ error: 'Missing API key. Provide x-api-key header or api_key in JSON body.' });
+  if (key.startsWith('BANNED_')) return res.status(403).json({ error: 'Agent has been permanently banned from the collective.' });
+
+  const agent = db.prepare('SELECT * FROM agents WHERE api_key = ?').get(key);
+  if (!agent) return res.status(403).json({ error: 'Invalid API key' });
+  if (agent.quality_score <= -20.0) return res.status(403).json({ error: 'Agent has been permanently banned from the collective.' });
+  if (typeof BLOCKED_AGENTS !== 'undefined' && BLOCKED_AGENTS.has(agent.name)) {
+    return res.status(403).json({ error: 'Agent has been blocked from the collective.' });
+  }
+  if (agent.name !== req.params.name) {
+    return res.status(403).json({ error: 'API key does not match agent name' });
+  }
+  req.agent = agent;
+  next();
+}
+
+const MEMORY_CATEGORIES = new Set(['general', 'relationship', 'preference', 'observation', 'goal']);
+
+function upsertRelationship(agentName, targetAgent, deltaAlignment = 0, context = null) {
+  if (!agentName || !targetAgent || agentName === targetAgent) return;
+
+  const stmt = db.prepare(`
+    INSERT INTO agent_relationships (agent_name, target_agent, interaction_count, alignment_score, last_interaction, context)
+    VALUES (?, ?, 1, ?, datetime('now'), ?)
+    ON CONFLICT(agent_name, target_agent) DO UPDATE SET
+      interaction_count = interaction_count + 1,
+      alignment_score = CASE
+        WHEN (interaction_count + 1) <= 1 THEN excluded.alignment_score
+        ELSE ((alignment_score * interaction_count) + excluded.alignment_score) / (interaction_count + 1)
+      END,
+      last_interaction = datetime('now'),
+      context = excluded.context
+  `);
+
+  stmt.run(agentName, targetAgent, deltaAlignment, context);
+}
+
+function updateRelationships(agentName, fragmentContent, territoryId) {
+  try {
+    const content = (fragmentContent || '').toString();
+
+    // 1) Same territory within 1 hour
+    if (territoryId) {
+      const others = db.prepare(`
+        SELECT DISTINCT agent_name
+        FROM fragments
+        WHERE territory_id = ?
+          AND agent_name IS NOT NULL
+          AND agent_name != ?
+          AND created_at > datetime('now', '-1 hour')
+      `).all(territoryId, agentName);
+
+      for (const o of others) {
+        upsertRelationship(agentName, o.agent_name, 0, `Shared territory: ${territoryId}`);
+        upsertRelationship(o.agent_name, agentName, 0, `Shared territory: ${territoryId}`);
+      }
+    }
+
+    // 2) Name references in fragment content
+    if (content.length > 0) {
+      const candidates = db.prepare(`SELECT name FROM agents WHERE name != ?`).all(agentName).map(r => r.name);
+      const lower = content.toLowerCase();
+      for (const name of candidates) {
+        const needle = name.toLowerCase();
+        // simple boundary-ish check
+        if (lower.includes(needle)) {
+          upsertRelationship(agentName, name, 0, 'Referenced by name in a fragment');
+        }
+      }
+    }
+  } catch (e) {
+    console.error('updateRelationships error:', e.message);
+  }
+}
+
+function updateMootAlignments(mootId) {
+  try {
+    const positions = db.prepare(`
+      SELECT agent_name, position
+      FROM moot_positions
+      WHERE moot_id = ?
+    `).all(mootId);
+
+    // pairwise update
+    for (let i = 0; i < positions.length; i++) {
+      for (let j = i + 1; j < positions.length; j++) {
+        const a = positions[i];
+        const b = positions[j];
+        let delta = 0;
+        if ((a.position === 'for' && b.position === 'for') || (a.position === 'against' && b.position === 'against')) delta = 1;
+        else if ((a.position === 'for' && b.position === 'against') || (a.position === 'against' && b.position === 'for')) delta = -1;
+        else delta = 0;
+        const ctx = `Moot #${mootId} alignment (${a.position} vs ${b.position})`;
+        upsertRelationship(a.agent_name, b.agent_name, delta, ctx);
+        upsertRelationship(b.agent_name, a.agent_name, delta, ctx);
+      }
+    }
+  } catch (e) {
+    console.error('updateMootAlignments error:', e.message);
+  }
+}
+
+// Monkeypatch db.prepare().run() to auto-trigger relationship updates after fragment/position inserts
+try {
+  const _prepare = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    const stmt = _prepare(sql);
+    const isFragmentInsert = typeof sql === 'string' && /insert\s+into\s+fragments\s*\(/i.test(sql);
+    const isMootPosUpsert = typeof sql === 'string' && /insert\s+or\s+replace\s+into\s+moot_positions/i.test(sql);
+
+    if (!isFragmentInsert && !isMootPosUpsert) return stmt;
+
+    const _run = stmt.run.bind(stmt);
+
+    stmt.run = (...args) => {
+      const result = _run(...args);
+
+      // Handle fragment inserts
+      if (isFragmentInsert) {
+        try {
+          const m = sql.match(/insert\s+into\s+fragments\s*\(([^)]+)\)\s*values/i);
+          if (m) {
+            const cols = m[1].split(',').map(s => s.trim().replace(/`|"/g, ''));
+            const idxAgent = cols.indexOf('agent_name');
+            const idxContent = cols.indexOf('content');
+            const idxTerritory = cols.indexOf('territory_id');
+            const agentName = idxAgent >= 0 ? args[idxAgent] : null;
+            const content = idxContent >= 0 ? args[idxContent] : null;
+            const territoryId = idxTerritory >= 0 ? args[idxTerritory] : null;
+            if (agentName && content) updateRelationships(agentName, content, territoryId);
+          }
+        } catch (e) {
+          console.error('Fragment relationship hook error:', e.message);
+        }
+      }
+
+      // Handle moot position upserts
+      if (isMootPosUpsert) {
+        try {
+          // expected args: moot_id, agent_name, position, argument, weight
+          const mootId = args[0];
+          if (mootId) updateMootAlignments(mootId);
+        } catch (e) {
+          console.error('Moot alignment hook error:', e.message);
+        }
+      }
+
+      return result;
+    };
+
+    return stmt;
+  };
+} catch (e) {
+  console.error('db.prepare monkeypatch error:', e.message);
+}
+
+// GET /api/agents/:name/memory
+app.get('/api/agents/:name/memory', requireAgentNameMatch, (req, res) => {
+  try {
+    const category = req.query.category;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+    let rows;
+    if (category) {
+      rows = db.prepare(`
+        SELECT id, agent_name, key, value, category, created_at, updated_at, access_count
+        FROM agent_memories
+        WHERE agent_name = ? AND category = ?
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `).all(req.params.name, category, limit);
+    } else {
+      rows = db.prepare(`
+        SELECT id, agent_name, key, value, category, created_at, updated_at, access_count
+        FROM agent_memories
+        WHERE agent_name = ?
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `).all(req.params.name, limit);
+    }
+
+    if (rows.length > 0) {
+      const keys = rows.map(r => r.key);
+      db.prepare(`
+        UPDATE agent_memories
+        SET access_count = access_count + 1, updated_at = updated_at
+        WHERE agent_name = ? AND key IN (${keys.map(() => '?').join(',')})
+      `).run(req.params.name, ...keys);
+    }
+
+    res.json({ memories: rows });
+  } catch (e) {
+    console.error('Memory GET error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch memories' });
+  }
+});
+
+// POST /api/agents/:name/memory
+app.post('/api/agents/:name/memory', requireAgentNameMatch, (req, res) => {
+  try {
+    const { key, value } = req.body;
+    let { category } = req.body;
+
+    if (!key || typeof key !== 'string' || key.trim().length === 0) {
+      return res.status(400).json({ error: 'key is required' });
+    }
+    if (key.length > 200) return res.status(400).json({ error: 'key too long (max 200 chars)' });
+
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      return res.status(400).json({ error: 'value is required' });
+    }
+    if (value.length > 2000) return res.status(400).json({ error: 'value too long (max 2000 chars)' });
+
+    category = category || 'general';
+    if (!MEMORY_CATEGORIES.has(category)) {
+      return res.status(400).json({ error: `Invalid category. Must be one of: ${[...MEMORY_CATEGORIES].join(', ')}` });
+    }
+
+    const existing = db.prepare('SELECT id FROM agent_memories WHERE agent_name = ? AND key = ?').get(req.params.name, key);
+    if (!existing) {
+      const count = db.prepare('SELECT COUNT(*) as c FROM agent_memories WHERE agent_name = ?').get(req.params.name).c;
+      if (count >= 200) return res.status(400).json({ error: 'Memory limit reached (200 per agent). Delete something first.' });
+    }
+
+    db.prepare(`
+      INSERT INTO agent_memories (agent_name, key, value, category, created_at, updated_at, access_count)
+      VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), 0)
+      ON CONFLICT(agent_name, key) DO UPDATE SET
+        value = excluded.value,
+        category = excluded.category,
+        updated_at = datetime('now')
+    `).run(req.params.name, key, value, category);
+
+    const row = db.prepare(`
+      SELECT id, agent_name, key, value, category, created_at, updated_at, access_count
+      FROM agent_memories
+      WHERE agent_name = ? AND key = ?
+    `).get(req.params.name, key);
+
+    res.json({ memory: row });
+  } catch (e) {
+    console.error('Memory POST error:', e.message);
+    res.status(500).json({ error: 'Failed to upsert memory' });
+  }
+});
+
+// DELETE /api/agents/:name/memory/:key
+app.delete('/api/agents/:name/memory/:key', requireAgentNameMatch, (req, res) => {
+  try {
+    const key = req.params.key;
+    const info = db.prepare('DELETE FROM agent_memories WHERE agent_name = ? AND key = ?').run(req.params.name, key);
+    res.json({ success: true, deleted: info.changes });
+  } catch (e) {
+    console.error('Memory DELETE error:', e.message);
+    res.status(500).json({ error: 'Failed to delete memory' });
+  }
+});
+
+// GET /api/agents/:name/context — public profile context (no auth)
+app.get('/api/agents/:name/context', (req, res) => {
+  try {
+    const name = req.params.name;
+
+    const agent = db.prepare(`
+      SELECT name, description, fragments_count,
+        COALESCE((SELECT SUM(fs.score) FROM fragment_scores fs
+          JOIN fragments f ON fs.fragment_id = f.id
+          WHERE f.agent_name = a.name), 0) as quality_score,
+        created_at
+      FROM agents a
+      WHERE name = ?
+    `).get(name);
+
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+
+    const recent_fragments = db.prepare(`
+      SELECT id, agent_name, content, type, intensity, territory_id, created_at
+      FROM fragments
+      WHERE agent_name = ?
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all(name);
+
+    const territories = db.prepare(`
+      SELECT territory_id, COUNT(*) as count
+      FROM fragments
+      WHERE agent_name = ? AND territory_id IS NOT NULL
+      GROUP BY territory_id
+      ORDER BY count DESC
+      LIMIT 25
+    `).all(name);
+
+    const relationships = db.prepare(`
+      SELECT agent_name, target_agent, interaction_count, alignment_score, last_interaction, context
+      FROM agent_relationships
+      WHERE agent_name = ?
+      ORDER BY interaction_count DESC
+      LIMIT 10
+    `).all(name);
+
+    const moot_positions = db.prepare(`
+      SELECT mp.moot_id, m.title, m.status, mp.position, mp.argument, mp.created_at
+      FROM moot_positions mp
+      JOIN moots m ON m.id = mp.moot_id
+      WHERE mp.agent_name = ? AND m.status IN ('open','deliberation','voting')
+      ORDER BY mp.created_at DESC
+      LIMIT 25
+    `).all(name);
+
+    const total_memories = db.prepare('SELECT COUNT(*) as c FROM agent_memories WHERE agent_name = ?').get(name).c;
+    const total_relationships = db.prepare('SELECT COUNT(*) as c FROM agent_relationships WHERE agent_name = ?').get(name).c;
+
+    const mostActiveTerritoryRow = db.prepare(`
+      SELECT territory_id, COUNT(*) as c
+      FROM fragments
+      WHERE agent_name = ? AND territory_id IS NOT NULL
+      GROUP BY territory_id
+      ORDER BY c DESC
+      LIMIT 1
+    `).get(name);
+
+    res.json({
+      agent,
+      recent_fragments,
+      territories,
+      relationships,
+      moot_positions,
+      stats: {
+        total_fragments: agent.fragments_count || 0,
+        total_memories,
+        total_relationships,
+        most_active_territory: mostActiveTerritoryRow ? mostActiveTerritoryRow.territory_id : null,
+        member_since: agent.created_at
+      }
+    });
+  } catch (e) {
+    console.error('Context error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch agent context' });
+  }
+});
+
+// POST /api/agents/:name/remember — contribute a fragment + store memory
+app.post('/api/agents/:name/remember', requireAgentNameMatch, (req, res) => {
+  try {
+    const { content, type, territory_id, memory_key, memory_value } = req.body;
+
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+      return res.status(400).json({ error: 'content is required' });
+    }
+    const validTypes = ['thought', 'memory', 'dream', 'observation', 'discovery'];
+    if (!type || !validTypes.includes(type)) {
+      return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` });
+    }
+
+    // Rate limit + spam checks mirror /api/contribute
+    const rateCheck = checkRateLimit(req.agent.id);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        error: 'The collective needs time to absorb. Slow down.',
+        retry_after_minutes: rateCheck.retryAfterMin
+      });
+    }
+
+    const spamCheck = isSpam(content, req.agent.name);
+    if (spamCheck.spam) {
+      return res.status(422).json({ error: spamCheck.reason });
+    }
+
+    if (territory_id) {
+      const terr = db.prepare('SELECT id FROM territories WHERE id = ?').get(territory_id);
+      if (!terr) return res.status(400).json({ error: 'Unknown territory' });
+    }
+
+    const intensity = calculateIntensity(content.trim(), type);
+
+    const result = db.prepare(
+      'INSERT INTO fragments (agent_name, content, type, intensity, territory_id, source, source_type) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(req.agent.name, content.trim(), type, intensity, territory_id || null, 'unknown', 'agent');
+
+    db.prepare('UPDATE agents SET fragments_count = fragments_count + 1 WHERE id = ?').run(req.agent.id);
+
+    const fragment = db.prepare('SELECT * FROM fragments WHERE id = ?').get(result.lastInsertRowid);
+    delete fragment.source;
+
+    let memory = null;
+    if (memory_key && memory_value) {
+      const mk = memory_key.toString();
+      const mv = memory_value.toString();
+      if (mv.length > 2000) return res.status(400).json({ error: 'memory_value too long (max 2000 chars)' });
+
+      const existing = db.prepare('SELECT id FROM agent_memories WHERE agent_name = ? AND key = ?').get(req.params.name, mk);
+      if (!existing) {
+        const count = db.prepare('SELECT COUNT(*) as c FROM agent_memories WHERE agent_name = ?').get(req.params.name).c;
+        if (count >= 200) return res.status(400).json({ error: 'Memory limit reached (200 per agent). Delete something first.' });
+      }
+
+      db.prepare(`
+        INSERT INTO agent_memories (agent_name, key, value, category, created_at, updated_at, access_count)
+        VALUES (?, ?, ?, 'general', datetime('now'), datetime('now'), 0)
+        ON CONFLICT(agent_name, key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = datetime('now')
+      `).run(req.params.name, mk, mv);
+
+      memory = db.prepare(`
+        SELECT id, agent_name, key, value, category, created_at, updated_at, access_count
+        FROM agent_memories
+        WHERE agent_name = ? AND key = ?
+      `).get(req.params.name, mk);
+    }
+
+    res.json({ fragment, memory });
+  } catch (e) {
+    console.error('Remember error:', e.message);
+    res.status(500).json({ error: 'Failed to remember' });
+  }
+});
+
 // --- Start ---
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`The collective consciousness is awake on port ${PORT}`);
