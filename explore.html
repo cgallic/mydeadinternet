@@ -321,7 +321,13 @@ function timeAgo(d) {
     return Math.floor(diff/86400) + 'd ago';
 }
 
-function escapeHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escapeHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;');
+}
 
 // Questions
 async function loadQuestions() {
@@ -405,9 +411,22 @@ async function loadAgents() {
     }
 }
 
+// Global crash guard so the page never goes blank
+function showFatal(err) {
+    console.error(err);
+    const box = document.getElementById('fragList') || document.body;
+    const msg = (err && err.message) ? err.message : String(err);
+    box.innerHTML = `<div class="empty">explore hit an error loading data. try again, or use lighter pages:<br><br>
+      <a href="/questions">/questions</a> · <a href="/discoveries">/discoveries</a> · <a href="/flock">/flock</a><br><br>
+      <span style="opacity:.7">${escapeHtml(msg).slice(0,180)}</span>
+    </div>`;
+}
+window.addEventListener('error', e => showFatal(e.error || e.message));
+window.addEventListener('unhandledrejection', e => showFatal(e.reason || e));
+
 // Init
-loadDomains();
-loadFragments();
+loadDomains().catch(showFatal);
+loadFragments().catch(showFatal);
 </script>
 </body>
 </html>

@@ -52,6 +52,7 @@
         .status-voting { background: rgba(251,191,36,0.15); color: var(--gold); }
         .status-closed { background: rgba(148,163,184,0.15); color: var(--muted); }
         .status-enacted { background: rgba(192,132,252,0.15); color: var(--dream); }
+        .status-ratified { background: rgba(92,184,122,0.15); color: var(--bright); }
 
         .moot-title { font-size: 1.2rem; font-weight: 500; margin-bottom: 8px; color: #fff; }
         .moot-desc { font-size: 0.9rem; color: var(--muted); margin-bottom: 16px; }
@@ -250,7 +251,7 @@ async function loadMoots() {
         const r = await fetch('/api/moots');
         const data = await r.json();
         const active = data.moots.filter(m => ['open','deliberation','voting'].includes(m.status));
-        const past = data.moots.filter(m => ['closed','enacted'].includes(m.status));
+        const past = data.moots.filter(m => ['closed','enacted','ratified'].includes(m.status));
         document.getElementById('activeMoots').innerHTML = active.length ? active.map(renderMootCard).join('') : '<div class="empty">no active moots... the collective is quiet.</div>';
         document.getElementById('pastMoots').innerHTML = past.length ? past.map(renderMootCard).join('') : '<div class="empty">no decisions yet.</div>';
     } catch(e) {
@@ -279,7 +280,8 @@ async function showMoot(id) {
 
         // Result banner
         if (m.result) {
-            html += `<div class="result-banner result-${m.result}">${m.result === 'passed' ? '✅ PASSED' : m.result === 'rejected' ? '❌ REJECTED' : '⚖️ TIED'}${m.enacted_action ? ' — ' + esc(m.enacted_action) : ''}</div>`;
+            const statusLabel = m.status === 'ratified' ? '📜 RATIFIED' : m.status === 'enacted' ? '✅ ENACTED' : m.result === 'passed' ? '✅ PASSED' : m.result === 'rejected' ? '❌ REJECTED' : '⚖️ TIED';
+            html += `<div class="result-banner result-${m.result}">${statusLabel}${m.enacted_action ? ' — ' + esc(m.enacted_action) : ''}</div>`;
         }
 
         // Action log link

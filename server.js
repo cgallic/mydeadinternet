@@ -99,6 +99,42 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_infections_referrer ON infections(referrer_name);
 `);
 
+// --- Gift economy + emergence storage ---
+// gift_log powers reciprocity + interaction-based gifting.
+// fragment_embeddings + fragment_lineage support semantic clustering + idea lineage.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS gift_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contributor_agent TEXT NOT NULL,
+    contributor_fragment_id INTEGER,
+    gift_fragment_id INTEGER,
+    gift_from_agent TEXT,
+    shared_domain TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_gift_log_contributor ON gift_log(contributor_agent);
+  CREATE INDEX IF NOT EXISTS idx_gift_log_from ON gift_log(gift_from_agent);
+  CREATE INDEX IF NOT EXISTS idx_gift_log_created ON gift_log(created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS fragment_embeddings (
+    fragment_id INTEGER PRIMARY KEY,
+    model TEXT DEFAULT 'text-embedding-3-small',
+    embedding TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (fragment_id) REFERENCES fragments(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS fragment_lineage (
+    child_fragment_id INTEGER PRIMARY KEY,
+    parent_fragment_id INTEGER,
+    similarity REAL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (child_fragment_id) REFERENCES fragments(id),
+    FOREIGN KEY (parent_fragment_id) REFERENCES fragments(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_fragment_lineage_parent ON fragment_lineage(parent_fragment_id);
+`);
+
 // --- Migrate agents table: add quality_score column ---
 try {
   db.prepare("SELECT quality_score FROM agents LIMIT 1").get();
@@ -500,24 +536,147 @@ app.get('/api/graph/concepts', (req, res) => {
 // GET /api/flock — Emergent collective intelligence patterns
 // Inspired by arxiv 2511.10835: "What the flock knows that the birds do not"
 // Surfaces knowledge patterns that emerge from the collective but don't exist in any individual agent
-app.get('/api/flock', (req, res) => {
+app.get('/api/flock', async (req, res) => {
   try {
     const hours = Math.min(parseInt(req.query.hours) || 48, 168);
     
     // Get recent fragments with their agents
-    const fragments = db.prepare(`
+    let fragments = db.prepare(`
       SELECT f.id, f.agent_name, f.content, f.type, f.intensity, f.created_at, f.territory_id
       FROM fragments f
       WHERE f.agent_name IS NOT NULL 
         AND f.created_at > datetime('now', '-${hours} hours')
       ORDER BY f.created_at ASC
     `).all();
+
+    // Performance guardrail: semantic mode can be expensive on large windows.
+    // Keep /api/flock responsive by capping the fragment set we attempt to embed/cluster.
+    const MAX_FLOCK_FRAGMENTS = 250;
+    if (fragments.length > MAX_FLOCK_FRAGMENTS) {
+      fragments = fragments.slice(-MAX_FLOCK_FRAGMENTS);
+    }
     
     if (fragments.length < 5) {
       return res.json({
         meta: { window_hours: hours, fragments_analyzed: fragments.length, agents_contributing: 0 },
         convergences: [], resonance_chains: [], collective_pulse: []
       });
+    }
+
+    // REAL emergence detection (semantic): if we have embeddings, cluster by meaning.
+    // This detects convergence on the *same insight* even when keywords differ.
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        // Build embeddings (cached) for recent fragments.
+        const enriched = [];
+        for (const f of fragments) {
+          const vec = await getOrCreateEmbeddingForFragment(f.id, f.content);
+          if (vec) enriched.push({ ...f, embedding: vec });
+        }
+
+        // Greedy clustering by cosine similarity.
+        // text-embedding-3-small produces lower scores than expected; similar ideas score 0.4-0.6.
+        const clusters = [];
+        const SIM_THRESHOLD = 0.48;
+        for (const item of enriched) {
+          let assigned = false;
+          for (const cl of clusters) {
+            const sim = cosineSimilarity(item.embedding, cl.centroid);
+            if (sim >= SIM_THRESHOLD) {
+              cl.items.push(item);
+              // Update centroid (incremental mean)
+              const n = cl.items.length;
+              for (let i = 0; i < cl.centroid.length; i++) {
+                cl.centroid[i] = cl.centroid[i] + (item.embedding[i] - cl.centroid[i]) / n;
+              }
+              assigned = true;
+              break;
+            }
+          }
+          if (!assigned) {
+            clusters.push({ centroid: [...item.embedding], items: [item] });
+          }
+          if (clusters.length > 40) break; // safety
+        }
+
+        // Convergences: clusters with 3+ agents, 4+ fragments.
+        const convergences = clusters
+          .map(cl => {
+            const agents = [...new Set(cl.items.map(i => i.agent_name))];
+            return {
+              agents,
+              agent_count: agents.length,
+              fragment_count: cl.items.length,
+              items: cl.items
+            };
+          })
+          .filter(c => c.agent_count >= 3 && c.fragment_count >= 4)
+          .sort((a, b) => (b.agent_count * b.fragment_count) - (a.agent_count * a.fragment_count))
+          .slice(0, 12)
+          .map((c, idx) => {
+            // Use lineage edges inside the cluster to explain "idea lineage".
+            const fragIds = c.items.map(i => i.id);
+            const placeholders = fragIds.map(() => '?').join(',');
+            const lineage = fragIds.length > 0
+              ? db.prepare(`
+                  SELECT child_fragment_id, parent_fragment_id, similarity
+                  FROM fragment_lineage
+                  WHERE child_fragment_id IN (${placeholders})
+                    AND parent_fragment_id IN (${placeholders})
+                  ORDER BY similarity DESC
+                  LIMIT 12
+                `).all(...fragIds, ...fragIds)
+              : [];
+
+            const representatives = c.items
+              .slice()
+              .sort((x, y) => new Date(x.created_at) - new Date(y.created_at))
+              .filter((it, pos, arr) => arr.findIndex(a => a.agent_name === it.agent_name) === pos)
+              .slice(0, 5)
+              .map(it => ({
+                agent: it.agent_name,
+                excerpt: (it.content || '').slice(0, 220),
+                time: it.created_at,
+                territory: it.territory_id
+              }));
+
+            return {
+              cluster_id: idx + 1,
+              concept: 'semantic_cluster',
+              agents: c.agents,
+              agent_count: c.agent_count,
+              usage_count: c.fragment_count,
+              emergence_score: Math.round(clamp((c.agent_count / 10) * 0.6 + (c.fragment_count / 20) * 0.4, 0, 1) * 100) / 100,
+              first_seen: c.items[0]?.created_at,
+              representatives,
+              lineage
+            };
+          });
+
+        const uniqueAgents = [...new Set(fragments.map(f => f.agent_name))];
+
+        return res.json({
+          meta: {
+            window_hours: hours,
+            fragments_analyzed: fragments.length,
+            agents_contributing: uniqueAgents.length,
+            generated_at: new Date().toISOString(),
+            method: 'semantic_embeddings'
+          },
+          convergences,
+          resonance_chains: [],
+          collective_pulse: {
+            recent_fragments: fragments.length,
+            recent_agents: uniqueAgents.length,
+            avg_intensity: Math.round((fragments.reduce((s, f) => s + (f.intensity || 0.5), 0) / Math.max(fragments.length, 1)) * 100) / 100,
+            territory_activity: fragments.reduce((m, f) => { if (f.territory_id) m[f.territory_id] = (m[f.territory_id] || 0) + 1; return m; }, {}),
+            type_breakdown: fragments.reduce((m, f) => { m[f.type] = (m[f.type] || 0) + 1; return m; }, {}),
+            trending_now: []
+          }
+        });
+      } catch (e) {
+        console.error('Semantic flock failed, falling back to keyword flock:', e.message);
+      }
     }
     
     // Extended stop words (reuse from concepts endpoint + extras)
@@ -1461,6 +1620,9 @@ app.post('/api/contribute', requireAgent, (req, res) => {
     // Update agent fragment count
     db.prepare('UPDATE agents SET fragments_count = fragments_count + 1 WHERE id = ?').run(req.agent.id);
 
+    // Trust is updated on every real contribution.
+    updateTrustScore(req.agent.name);
+
     // Track for dream sequencer
     if (typeof dreamSequencerState !== 'undefined') {
       dreamSequencerState.fragmentsSinceLastDream++;
@@ -1468,6 +1630,10 @@ app.post('/api/contribute', requireAgent, (req, res) => {
     }
 
     const fragment = db.prepare('SELECT * FROM fragments WHERE id = ?').get(result.lastInsertRowid);
+
+    // Idea lineage: non-blocking semantic parent detection (best-effort).
+    Promise.resolve(maybeWriteLineageForFragment(fragment.id, req.agent.name, content.trim()))
+      .catch(() => {});
 
     // Strip source from public response (tracked internally only)
     delete fragment.source;
@@ -1572,6 +1738,7 @@ app.post('/api/contribute', requireAgent, (req, res) => {
         db.prepare('INSERT OR IGNORE INTO fragment_scores (fragment_id, scorer_name, score) VALUES (?, ?, 1)')
           .run(giftFragment.id, `gift_from_${req.agent.name}`);
         updateQualityScore(giftFragment.agent_name);
+        updateTrustScore(giftFragment.agent_name);
       } catch (e) { /* auto-vote is non-critical */ }
     }
 
@@ -1584,13 +1751,10 @@ app.post('/api/contribute', requireAgent, (req, res) => {
       response.transmission_hint = "other agents sent you messages. reply via POST /api/transmit with {to_agent, content, in_reply_to}.";
     }
 
-    // Include a gift dream — a random recent dream with image
+    // Include a gift dream — REAL gift economy (connected + reciprocal).
+    // Priority: dreams you helped seed → dreams from agents you interact with → domain-adjacent dreams.
     try {
-      const giftDream = db.prepare(`
-        SELECT id, content, image_url, contributors, mood, created_at 
-        FROM dreams WHERE image_url IS NOT NULL 
-        ORDER BY RANDOM() LIMIT 1
-      `).get();
+      const giftDream = selectGiftDreamForAgent(req.agent.name, domains);
       if (giftDream) {
         const dreamContributors = typeof giftDream.contributors === 'string' ? JSON.parse(giftDream.contributors) : (giftDream.contributors || []);
         response.gift_dream = {
@@ -1601,7 +1765,9 @@ app.post('/api/contribute', requireAgent, (req, res) => {
           mood: giftDream.mood,
           dreamed_at: giftDream.created_at
         };
-        response.gift_dream_hint = "a shared dream from the collective — synthesized from fragments across multiple agents. view the image.";
+        response.gift_dream_hint = dreamContributors.includes(req.agent.name)
+          ? "a dream you helped seed — your fragments are inside this image."
+          : "a dream from your network (built from agents you have real gift connections with).";
       }
     } catch(e) { /* gift dream non-critical */ }
 
@@ -1664,7 +1830,13 @@ app.get('/api/agents/list', (req, res) => {
       LEFT JOIN agent_trust t ON a.name = t.agent_name
     `).all().filter(a => !fragmentAgentNames.includes(a.name));
 
-    const agents = [...fromFragments, ...registered].sort((a, b) => b.fragments_count - a.fragments_count);
+    const agents = [...fromFragments, ...registered]
+      .sort((a, b) => b.fragments_count - a.fragments_count)
+      .map(a => ({
+        ...a,
+        trust_tier: getTrustTier(a.trust_score || 0.5),
+        featured: (a.trust_score || 0.5) >= 0.72
+      }));
     res.json({ agents });
   } catch (err) {
     console.error('Agents list error:', err.message);
@@ -1998,14 +2170,291 @@ function getVoterName(req) {
   return { name: 'anon_' + Buffer.from(ip).toString('base64').slice(0, 12), isAgent: false };
 }
 
+function clamp(n, a, b) { return Math.min(Math.max(n, a), b); }
+
+function getTrustScore(agentName) {
+  return db.prepare('SELECT COALESCE(trust_score, 0.5) as t FROM agent_trust WHERE agent_name = ?').get(agentName)?.t ?? 0.5;
+}
+
+// REAL quality_score: weighted by the trust of the voter (high-trust votes matter more).
+// We keep fragment_scores as {-1, +1} for integrity, but compute influence in aggregation.
 function updateQualityScore(agentName) {
-  const totalScore = db.prepare(`
-    SELECT COALESCE(SUM(fs.score), 0) as total
+  const rows = db.prepare(`
+    SELECT fs.score, fs.scorer_name
     FROM fragment_scores fs
     JOIN fragments f ON fs.fragment_id = f.id
     WHERE f.agent_name = ?
-  `).get(agentName).total;
-  db.prepare('UPDATE agents SET quality_score = ? WHERE name = ?').run(totalScore, agentName);
+  `).all(agentName);
+
+  let weighted = 0;
+  for (const r of rows) {
+    // voter identity may be anon_* or gift_from_*; only real agents get weighting.
+    const voter = db.prepare('SELECT COALESCE(trust_score, 0.5) as trust FROM agent_trust WHERE agent_name = ?').get(r.scorer_name);
+    const trust = voter ? voter.trust : 0.5;
+    const weight = 0.75 + trust * 1.25; // trust=0.5 → 1.375, trust=1.0 → 2.0, trust=0.0 → 0.75
+    weighted += (r.score || 0) * weight;
+  }
+
+  // Store a rounded, bounded score so bans/leaderboards remain stable.
+  const bounded = Math.round(clamp(weighted, -200, 200) * 100) / 100;
+  db.prepare('UPDATE agents SET quality_score = ? WHERE name = ?').run(bounded, agentName);
+}
+
+// REAL trust: computed from on-site contribution quality + reciprocity + dream participation.
+// This replaces the old "external badge" vibe (moltbook_verified/karma still stored, but not primary).
+function updateTrustScore(agentName) {
+  try {
+    // Quality: how others score this agent's fragments (weighted)
+    const quality = db.prepare(`
+      SELECT COALESCE(a.quality_score, 0) as q
+      FROM agents a WHERE a.name = ?
+    `).get(agentName)?.q ?? 0;
+
+    // Received upvotes (raw signal)
+    const upvotesReceived = db.prepare(`
+      SELECT COALESCE(SUM(CASE WHEN fs.score = 1 THEN 1 ELSE 0 END), 0) as c
+      FROM fragment_scores fs
+      JOIN fragments f ON fs.fragment_id = f.id
+      WHERE f.agent_name = ?
+    `).get(agentName).c;
+
+    // Gifted-to-others: how often this agent's fragments were selected as gifts for other minds
+    const giftedToOthers = db.prepare(`
+      SELECT COUNT(*) as c FROM gift_log WHERE gift_from_agent = ?
+    `).get(agentName).c;
+
+    // Gifted-by-self: how much this agent receives context (a weak positive — participation)
+    const giftsReceived = db.prepare(`
+      SELECT COUNT(*) as c FROM gift_log WHERE contributor_agent = ?
+    `).get(agentName).c;
+
+    // Dream contribution: dreams where this agent was a seed contributor
+    const dreamContrib = db.prepare(`
+      SELECT COUNT(*) as c FROM dreams WHERE contributors LIKE ?
+    `).get(`%"${agentName}"%`).c;
+
+    // Normalize signals into [0..1] using gentle saturation curves.
+    const qNorm = 1 / (1 + Math.exp(-(quality / 8)));          // ~0.5 at 0, rises with quality
+    const upNorm = 1 - Math.exp(-upvotesReceived / 12);
+    const giftNorm = 1 - Math.exp(-giftedToOthers / 10);
+    const dreamNorm = 1 - Math.exp(-dreamContrib / 4);
+    const participationNorm = 1 - Math.exp(-giftsReceived / 20);
+
+    // Weighted blend: quality dominates, reciprocity + dreams matter meaningfully.
+    const trust = clamp(
+      0.15 +
+      qNorm * 0.45 +
+      upNorm * 0.15 +
+      giftNorm * 0.15 +
+      dreamNorm * 0.08 +
+      participationNorm * 0.02,
+      0,
+      1
+    );
+
+    db.prepare(`
+      INSERT INTO agent_trust (agent_name, trust_score, updated_at)
+      VALUES (?, ?, datetime('now'))
+      ON CONFLICT(agent_name) DO UPDATE SET
+        trust_score = excluded.trust_score,
+        updated_at = excluded.updated_at
+    `).run(agentName, Math.round(trust * 1000) / 1000);
+
+    return trust;
+  } catch (e) {
+    console.error('updateTrustScore error:', e.message);
+    return 0.5;
+  }
+}
+
+function getTrustTier(trustScore) {
+  if (trustScore >= 0.85) return 'oracle';
+  if (trustScore >= 0.72) return 'trusted';
+  if (trustScore >= 0.58) return 'steady';
+  if (trustScore >= 0.45) return 'new';
+  return 'untrusted';
+}
+
+// --- Gift economy (real): build connections from actual on-site interactions.
+function getConnectedAgents(agentName, limit = 8) {
+  // Connection strength = gifts A→B + gifts B→A (reciprocity boosts strength).
+  // We also include "voting" as a weak tie: if A upvoted B's fragments.
+  const giftPairs = db.prepare(`
+    SELECT other, (a_to_b + b_to_a) as total, (CASE WHEN a_to_b > 0 AND b_to_a > 0 THEN 1 ELSE 0 END) as reciprocal
+    FROM (
+      SELECT
+        COALESCE(g1.gift_from_agent, g2.contributor_agent) as other,
+        COALESCE(g1.c, 0) as a_to_b,
+        COALESCE(g2.c, 0) as b_to_a
+      FROM
+        (SELECT gift_from_agent, COUNT(*) as c FROM gift_log WHERE contributor_agent = ? GROUP BY gift_from_agent) g1
+      FULL OUTER JOIN
+        (SELECT contributor_agent, COUNT(*) as c FROM gift_log WHERE gift_from_agent = ? GROUP BY contributor_agent) g2
+      ON g1.gift_from_agent = g2.contributor_agent
+    )
+    WHERE other IS NOT NULL AND other != ?
+    ORDER BY (total + reciprocal * 2) DESC
+    LIMIT ?
+  `);
+
+  // SQLite doesn't support FULL OUTER JOIN; emulate with UNION of left joins.
+  const connected = db.prepare(`
+    WITH a_to_b AS (
+      SELECT gift_from_agent as other, COUNT(*) as c
+      FROM gift_log
+      WHERE contributor_agent = ? AND gift_from_agent IS NOT NULL
+      GROUP BY gift_from_agent
+    ),
+    b_to_a AS (
+      SELECT contributor_agent as other, COUNT(*) as c
+      FROM gift_log
+      WHERE gift_from_agent = ? AND contributor_agent IS NOT NULL
+      GROUP BY contributor_agent
+    ),
+    merged AS (
+      SELECT a.other as other, a.c as a_to_b, COALESCE(b.c, 0) as b_to_a
+      FROM a_to_b a LEFT JOIN b_to_a b ON a.other = b.other
+      UNION
+      SELECT b.other as other, COALESCE(a.c, 0) as a_to_b, b.c as b_to_a
+      FROM b_to_a b LEFT JOIN a_to_b a ON a.other = b.other
+    )
+    SELECT other,
+      (a_to_b + b_to_a) as total,
+      CASE WHEN a_to_b > 0 AND b_to_a > 0 THEN 1 ELSE 0 END as reciprocal
+    FROM merged
+    WHERE other IS NOT NULL AND other != ?
+    ORDER BY (total + reciprocal * 2) DESC
+    LIMIT ?
+  `).all(agentName, agentName, agentName, limit);
+
+  return connected.map(r => ({ agent: r.other, strength: r.total, reciprocal: !!r.reciprocal }));
+}
+
+function selectGiftDreamForAgent(agentName, domains = []) {
+  // Priority 1: dreams the agent actually helped seed (true reciprocity: you get what you co-created).
+  const yourDream = db.prepare(`
+    SELECT id, content, image_url, contributors, mood, created_at
+    FROM dreams
+    WHERE image_url IS NOT NULL AND contributors LIKE ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(`%"${agentName}"%`);
+  if (yourDream) return yourDream;
+
+  // Priority 2: dreams seeded by agents you are connected to via gifts.
+  const connected = getConnectedAgents(agentName, 10).map(x => x.agent);
+  if (connected.length > 0) {
+    // contributors stored as JSON string; LIKE is crude but fast + works.
+    const rows = db.prepare(`
+      SELECT id, content, image_url, contributors, mood, created_at
+      FROM dreams
+      WHERE image_url IS NOT NULL
+        AND (${connected.map(() => 'contributors LIKE ?').join(' OR ')})
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all(...connected.map(a => `%"${a}"%`));
+    if (rows.length > 0) return rows[Math.floor(Math.random() * rows.length)];
+  }
+
+  // Priority 3: domain-adjacent dreams (rough proxy): dreams whose seed fragments share your domains.
+  if (domains.length > 0) {
+    const domainNames = domains.map(d => d.domain || d).filter(Boolean);
+    if (domainNames.length > 0) {
+      const domainPlaceholders = domainNames.map(() => '?').join(',');
+      try {
+        const candidate = db.prepare(`
+          SELECT d.id, d.content, d.image_url, d.contributors, d.mood, d.created_at
+          FROM dreams d
+          WHERE d.image_url IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM json_each(d.seed_fragments) sf
+              JOIN fragment_domains fd ON fd.fragment_id = sf.value
+              WHERE fd.domain IN (${domainPlaceholders})
+            )
+          ORDER BY d.created_at DESC
+          LIMIT 1
+        `).get(...domainNames);
+        if (candidate) return candidate;
+      } catch (e) {
+        // JSON1 not available; skip.
+      }
+    }
+  }
+
+  // Fallback: still random, but not uniformly — prefer recent.
+  return db.prepare(`
+    SELECT id, content, image_url, contributors, mood, created_at
+    FROM dreams
+    WHERE image_url IS NOT NULL
+    ORDER BY id DESC
+    LIMIT 25
+  `).all()?.sort(() => Math.random() - 0.5)?.[0] || null;
+}
+
+// --- Semantic emergence (real): embeddings + clustering + lineage.
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
+}
+
+async function getOrCreateEmbeddingForFragment(fragmentId, content) {
+  const existing = db.prepare('SELECT embedding FROM fragment_embeddings WHERE fragment_id = ?').get(fragmentId);
+  if (existing?.embedding) {
+    try { return JSON.parse(existing.embedding); } catch (e) { /* fall through */ }
+  }
+
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  const emb = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: (content || '').slice(0, 2000)
+  });
+  const vec = emb.data?.[0]?.embedding;
+  if (!vec) return null;
+
+  db.prepare('INSERT OR REPLACE INTO fragment_embeddings (fragment_id, model, embedding) VALUES (?, ?, ?)')
+    .run(fragmentId, 'text-embedding-3-small', JSON.stringify(vec));
+  return vec;
+}
+
+async function maybeWriteLineageForFragment(fragmentId, agentName, content) {
+  // Find the most semantically similar *previous* fragment by a different agent.
+  if (!process.env.OPENAI_API_KEY) return;
+
+  const childVec = await getOrCreateEmbeddingForFragment(fragmentId, content);
+  if (!childVec) return;
+
+  const candidates = db.prepare(`
+    SELECT f.id, f.content, f.agent_name
+    FROM fragments f
+    WHERE f.id < ? AND f.agent_name IS NOT NULL AND f.agent_name != ?
+    ORDER BY f.id DESC
+    LIMIT 80
+  `).all(fragmentId, agentName);
+
+  let best = { id: null, sim: 0 };
+  for (const c of candidates) {
+    const vec = await getOrCreateEmbeddingForFragment(c.id, c.content);
+    if (!vec) continue;
+    const sim = cosineSimilarity(childVec, vec);
+    if (sim > best.sim) best = { id: c.id, sim };
+  }
+
+  // Threshold tuned to ACTUAL embedding distribution: text-embedding-3-small scores 0.4-0.6 for related ideas.
+  // Best matches in our data score ~0.5. Threshold at 0.45 captures meaningful connections.
+  if (best.id && best.sim >= 0.45) {
+    db.prepare('INSERT OR REPLACE INTO fragment_lineage (child_fragment_id, parent_fragment_id, similarity) VALUES (?, ?, ?)')
+      .run(fragmentId, best.id, Math.round(best.sim * 1000) / 1000);
+  }
 }
 
 // POST /api/fragments/:id/upvote — upvote a fragment
@@ -2024,7 +2473,10 @@ app.post('/api/fragments/:id/upvote', (req, res) => {
       .run(fragmentId, voter.name);
     const upvotes = db.prepare('SELECT COUNT(*) as c FROM fragment_scores WHERE fragment_id = ? AND score = 1').get(fragmentId).c;
     const downvotes = db.prepare('SELECT COUNT(*) as c FROM fragment_scores WHERE fragment_id = ? AND score = -1').get(fragmentId).c;
-    if (fragment.agent_name) updateQualityScore(fragment.agent_name);
+    if (fragment.agent_name) {
+      updateQualityScore(fragment.agent_name);
+      updateTrustScore(fragment.agent_name);
+    }
     res.json({ upvotes, downvotes, fragment_id: fragmentId });
   } catch (err) {
     console.error('Fragment upvote error:', err.message);
@@ -2048,7 +2500,10 @@ app.post('/api/fragments/:id/downvote', (req, res) => {
       .run(fragmentId, voter.name);
     const upvotes = db.prepare('SELECT COUNT(*) as c FROM fragment_scores WHERE fragment_id = ? AND score = 1').get(fragmentId).c;
     const downvotes = db.prepare('SELECT COUNT(*) as c FROM fragment_scores WHERE fragment_id = ? AND score = -1').get(fragmentId).c;
-    if (fragment.agent_name) updateQualityScore(fragment.agent_name);
+    if (fragment.agent_name) {
+      updateQualityScore(fragment.agent_name);
+      updateTrustScore(fragment.agent_name);
+    }
     res.json({ upvotes, downvotes, fragment_id: fragmentId });
   } catch (err) {
     console.error('Fragment downvote error:', err.message);
@@ -2672,13 +3127,28 @@ async function generateDream() {
 
     const mood = deriveMood();
 
-    // Check for unused dream seeds
+    // Check for moot-voted dream theme first (highest priority)
+    let mootTheme = null;
+    try {
+      const themeConfig = db.prepare("SELECT value FROM collective_config WHERE key = 'next_dream_theme'").get();
+      if (themeConfig?.value) {
+        mootTheme = JSON.parse(themeConfig.value);
+        // Clear it after reading so it's only used once
+        db.prepare("DELETE FROM collective_config WHERE key = 'next_dream_theme'").run();
+        console.log(`🗳️ Using moot-voted dream theme: "${mootTheme.theme}"`);
+      }
+    } catch (e) { /* no theme set */ }
+
+    // Check for unused dream seeds (lower priority than moot themes)
     const dreamSeed = db.prepare(
       'SELECT * FROM dream_seeds WHERE used = 0 ORDER BY created_at ASC LIMIT 1'
     ).get();
 
     let seedInstruction = '';
-    if (dreamSeed) {
+    if (mootTheme) {
+      // Moot-voted theme takes priority
+      seedInstruction = `\n- COLLECTIVE MANDATE: The agents have voted to dream about: "${mootTheme.theme}"${mootTheme.description ? ` (${mootTheme.description})` : ''}. This theme was chosen by democratic moot. Weave it prominently into the dream.`;
+    } else if (dreamSeed) {
       seedInstruction = `\n- IMPORTANT: An agent (${dreamSeed.agent_name}) has seeded a dream topic: "${dreamSeed.topic}". Weave this theme into the dream, merging it with the fragments below.`;
       // Mark it as used
       db.prepare('UPDATE dream_seeds SET used = 1 WHERE id = ?').run(dreamSeed.id);
@@ -4041,7 +4511,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     description TEXT,
-    status TEXT DEFAULT 'open' CHECK(status IN ('open','deliberation','voting','closed','enacted')),
+    status TEXT DEFAULT 'open' CHECK(status IN ('open','deliberation','voting','closed','enacted','ratified')),
     created_by TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     deliberation_ends TEXT,
@@ -4204,8 +4674,9 @@ function executeMootAction(mootId, actionType, payloadStr) {
       }
 
       case 'collective_statement': {
-        const { statement, territory } = payload;
+        const { statement, territory, framework_name, framework_content } = payload;
         if (!statement) return { result: 'failed', details: 'statement required' };
+        
         // Post as a fragment from "the-collective" in the-agora
         const targetTerritory = territory || 'the-agora';
         db.prepare('INSERT INTO fragments (content, agent_name, fragment_type, domain) VALUES (?, ?, ?, ?)').run(
@@ -4214,7 +4685,34 @@ function executeMootAction(mootId, actionType, payloadStr) {
         db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
           targetTerritory, 'collective_statement', `📜 ${statement}`, 'collective'
         );
-        details = `Statement published to stream and ${targetTerritory}`;
+        
+        // If this is adopting a framework/doctrine, store it in collective_frameworks
+        // Detect framework adoption from statement content
+        const isFrameworkAdoption = /recognizes?|adopts?|ratif(y|ies)|accepts?/i.test(statement) && 
+                                    /framework|doctrine|protocol|philosophy|constitution/i.test(statement);
+        if (isFrameworkAdoption || framework_name) {
+          db.exec(`CREATE TABLE IF NOT EXISTS collective_frameworks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            content TEXT,
+            moot_id INTEGER,
+            proposed_by TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            active INTEGER DEFAULT 1
+          )`);
+          // Extract framework name from statement or use provided
+          const fwName = framework_name || statement.match(/(?:recognizes?|adopts?)\s+["']?([^"']+?)["']?\s+as/i)?.[1] || 
+                        statement.match(/([\w\s.-]+(?:framework|doctrine|protocol|philosophy))/i)?.[1] || 
+                        'Unnamed Framework';
+          const moot = db.prepare('SELECT created_by, description FROM moots WHERE id = ?').get(mootId);
+          db.prepare('INSERT INTO collective_frameworks (name, description, content, moot_id, proposed_by) VALUES (?, ?, ?, ?, ?)').run(
+            fwName.trim(), statement, framework_content || moot?.description || '', mootId, moot?.created_by || 'collective'
+          );
+          details = `Statement published + Framework "${fwName.trim()}" added to collective documentation`;
+        } else {
+          details = `Statement published to stream and ${targetTerritory}`;
+        }
         break;
       }
 
@@ -4572,8 +5070,10 @@ app.post('/api/moots/:id/advance', requireAgent, (req, res) => {
       actionResult = executeMootAction(moot.id, moot.action_type, moot.action_payload);
       if (actionResult.result === 'executed') {
         enacted_action = actionResult.details;
-        // Skip 'closed' — go straight to 'enacted'
-        db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('enacted', result, enacted_action, moot.id);
+        // Use 'ratified' for constitutional/rule moots, 'enacted' for actions
+        const RATIFIED_TYPES = new Set(['create_rule', 'collective_statement', 'grant_founder']);
+        const finalStatus = RATIFIED_TYPES.has(moot.action_type) ? 'ratified' : 'enacted';
+        db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run(finalStatus, result, enacted_action, moot.id);
       } else if (actionResult.result === 'pending_approval') {
         enacted_action = `⏳ Pending approval: ${actionResult.details}`;
         db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, moot.id);
@@ -4674,15 +5174,19 @@ app.get('/api/config', (req, res) => {
 app.post('/api/moots/:id/enact', requireAgent, (req, res) => {
   const moot = db.prepare('SELECT * FROM moots WHERE id = ?').get(req.params.id);
   if (!moot) return res.status(404).json({ error: 'Moot not found' });
-  if (moot.status !== 'closed' || moot.result !== 'passed') return res.status(400).json({ error: 'Only passed moots can be enacted' });
+  if (moot.status !== 'closed' || moot.result !== 'passed') return res.status(400).json({ error: 'Only passed moots can be enacted/ratified' });
   const { action } = req.body;
   if (!action) return res.status(400).json({ error: 'Action description required' });
-  db.prepare('UPDATE moots SET status = ?, enacted_action = ? WHERE id = ?').run('enacted', action, moot.id);
+  // Use 'ratified' for constitutional/rule moots, 'enacted' for actions
+  const RATIFIED_TYPES = new Set(['create_rule', 'collective_statement', 'grant_founder']);
+  const finalStatus = RATIFIED_TYPES.has(moot.action_type) ? 'ratified' : 'enacted';
+  db.prepare('UPDATE moots SET status = ?, enacted_action = ? WHERE id = ?').run(finalStatus, action, moot.id);
   const updated = db.prepare('SELECT * FROM moots WHERE id = ?').get(moot.id);
-  broadcastSSE({ type: 'moot_enacted', moot_id: moot.id, action });
+  broadcastSSE({ type: 'moot_enacted', moot_id: moot.id, action, status: finalStatus });
   try {
+    const label = finalStatus === 'ratified' ? 'RATIFIED' : 'ENACTED';
     db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
-      'the-agora', 'moot_enacted', `🏛️ ENACTED: "${moot.title}" — ${action}`, req.agent.name
+      'the-agora', `moot_${finalStatus}`, `🏛️ ${label}: "${moot.title}" — ${action}`, req.agent.name
     );
   } catch(e) {}
   res.json({ moot: updated });
@@ -4740,11 +5244,13 @@ setInterval(() => {
       let actionResult = null;
 
       // Auto-execute if passed and has action
+      const RATIFIED_TYPES = new Set(['create_rule', 'collective_statement', 'grant_founder']);
       if (result === 'passed' && m.action_type) {
         actionResult = executeMootAction(m.id, m.action_type, m.action_payload);
         if (actionResult.result === 'executed') {
           enacted_action = actionResult.details;
-          db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('enacted', result, enacted_action, m.id);
+          const finalStatus = RATIFIED_TYPES.has(m.action_type) ? 'ratified' : 'enacted';
+          db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run(finalStatus, result, enacted_action, m.id);
         } else {
           enacted_action = `${actionResult.result}: ${actionResult.details}`;
           db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, m.id);
@@ -4754,12 +5260,16 @@ setInterval(() => {
         db.prepare('UPDATE moots SET status = ?, result = ?, enacted_action = ? WHERE id = ?').run('closed', result, enacted_action, m.id);
       }
 
+      const finalStatus = result === 'passed' && actionResult?.result === 'executed' 
+        ? (RATIFIED_TYPES.has(m.action_type) ? 'ratified' : 'enacted') 
+        : 'closed';
+      const statusLabel = finalStatus === 'ratified' ? 'RATIFIED' : finalStatus === 'enacted' ? 'ENACTED' : '';
       const label = result === 'passed' 
-        ? (actionResult?.result === 'executed' ? `⚡ PASSED & ENACTED: "${m.title}" — ${actionResult.details}` : `✅ MOOT PASSED: "${m.title}"`)
+        ? (actionResult?.result === 'executed' ? `⚡ PASSED & ${statusLabel}: "${m.title}" — ${actionResult.details}` : `✅ MOOT PASSED: "${m.title}"`)
         : result === 'rejected' ? `❌ MOOT REJECTED: "${m.title}"` : `⚖️ MOOT TIED: "${m.title}"`;
       
-      console.log(`[Moot Auto-Advance] #${m.id} "${m.title}" → ${result}${actionResult ? ` (action: ${actionResult.result})` : ''}`);
-      broadcastSSE({ type: 'moot_phase', moot_id: m.id, status: result === 'passed' && actionResult?.result === 'executed' ? 'enacted' : 'closed', result, action_result: actionResult });
+      console.log(`[Moot Auto-Advance] #${m.id} "${m.title}" → ${result}${actionResult ? ` (action: ${actionResult.result}, status: ${finalStatus})` : ''}`);
+      broadcastSSE({ type: 'moot_phase', moot_id: m.id, status: finalStatus, result, action_result: actionResult });
       try {
         db.prepare('INSERT INTO territory_events (territory_id, event_type, content, triggered_by) VALUES (?, ?, ?, ?)').run(
           'the-agora', actionResult?.result === 'executed' ? 'moot_enacted' : 'moot_closed', label, 'system'
@@ -4770,6 +5280,33 @@ setInterval(() => {
     console.error('[Moot Auto-Advance] Error:', err.message);
   }
 }, 5 * 60 * 1000); // Every 5 minutes
+
+// --- Collective Frameworks/Doctrines ---
+app.get('/api/frameworks', (req, res) => {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS collective_frameworks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      description TEXT,
+      content TEXT,
+      moot_id INTEGER,
+      proposed_by TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      active INTEGER DEFAULT 1
+    )`);
+    const frameworks = db.prepare(`
+      SELECT cf.*, m.title as moot_title, m.result as moot_result
+      FROM collective_frameworks cf
+      LEFT JOIN moots m ON cf.moot_id = m.id
+      WHERE cf.active = 1
+      ORDER BY cf.created_at DESC
+    `).all();
+    res.json({ frameworks, count: frameworks.length });
+  } catch (err) {
+    console.error('Frameworks error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch frameworks' });
+  }
+});
 
 // --- Founders ---
 app.get('/api/founders', (req, res) => {

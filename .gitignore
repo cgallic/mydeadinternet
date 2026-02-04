@@ -9,3 +9,5 @@ api/consciousness.json
 *.db-shm
 *.db-wal
 *.bak*
+data/
+logs/
